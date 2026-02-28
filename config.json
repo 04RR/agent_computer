@@ -1,0 +1,48 @@
+{
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "agent": {
+    "id": "main",
+    "name": "agent_computer Agent",
+    "workspace": "./workspace",
+    "model": {
+      "provider": "lmstudio",
+      "model_id": "qwen/qwen3.5-35b-a3b",
+      "base_url": "http://10.5.0.2:1234/v1",
+      "max_tokens": 4096
+    },
+    "tools": {
+      "allow": [
+        "shell",
+        "read_file",
+        "write_file",
+        "list_directory",
+        "web_fetch",
+        "web_fetch_js",
+        "web_fetch_stealth",
+        "manage_tasks"
+      ],
+      "require_approval": [
+        "shell"
+      ]
+    },
+    "max_loop_iterations": 15,
+    "deep_work": {
+      "max_iterations": 200,
+      "token_budget": 1500000,
+      "warning_threshold": 0.8
+    }
+  },
+  "sessions": {
+    "directory": "./sessions",
+    "max_history_tokens": 100000
+  },
+  "reflection": {
+    "enabled": true,
+    "model_id": "",
+    "max_tokens": 4096,
+    "max_sessions_per_startup": 10
+  }
+}
