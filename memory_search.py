@@ -2,6 +2,9 @@
 
 Combines vector search (via LM Studio embeddings) with keyword search
 using Reciprocal Rank Fusion. Stores everything in a local SQLite database.
+
+Keyword search uses SQLite FTS5 (BM25). Vector search uses a pre-built
+NumPy matrix for O(1) batch cosine similarity.
 """
 
 from __future__ import annotations
@@ -9,11 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import re
 import sqlite3
 import time
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,12 +23,8 @@ from openai import OpenAI
 
 logger = logging.getLogger("agent_computer.memory_search")
 
-_STOP_WORDS = frozenset(
-    "the a an is are was were be been being have has had do does did will would "
-    "could should may might shall can to of in for on with at by from as into "
-    "through during before after and but or nor not so yet it its this that "
-    "these those i me my we".split()
-)
+# Characters with special meaning in FTS5 query syntax
+_FTS5_SPECIAL = re.compile(r'[":*^{}()\[\]|&!]')
 
 
 @dataclass
@@ -54,6 +51,11 @@ class MemorySearch:
         self._client: OpenAI | None = None
         self._embeddings_available = True
 
+        # Vectorized search state
+        self._embedding_matrix: np.ndarray | None = None
+        self._embedding_ids: list[int] = []
+        self._matrix_dirty: bool = True
+
         try:
             self._client = OpenAI(base_url=embedding_base_url, api_key="lm-studio")
         except Exception as e:
@@ -71,6 +73,41 @@ class MemorySearch:
                 embedding BLOB, created_at REAL NOT NULL,
                 UNIQUE(source_type, source_id))""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_source ON memories(source_type, source_id)")
+
+            # FTS5 virtual table for keyword search
+            conn.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
+                USING fts5(title, content, content=memories, content_rowid=id)""")
+
+            # Triggers to keep FTS in sync with the main table
+            conn.executescript("""
+                CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+                    INSERT INTO memories_fts(rowid, title, content)
+                    VALUES (new.id, new.title, new.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, title, content)
+                    VALUES ('delete', old.id, old.title, old.content);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, title, content)
+                    VALUES ('delete', old.id, old.title, old.content);
+                    INSERT INTO memories_fts(rowid, title, content)
+                    VALUES (new.id, new.title, new.content);
+                END;
+            """)
+
+            # One-time backfill: populate FTS from existing rows if needed
+            try:
+                fts_count = conn.execute("SELECT COUNT(*) FROM memories_fts").fetchone()[0]
+                mem_count = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+                if fts_count == 0 and mem_count > 0:
+                    conn.execute(
+                        "INSERT INTO memories_fts(rowid, title, content) "
+                        "SELECT id, title, content FROM memories"
+                    )
+                    logger.info(f"Backfilled {mem_count} rows into FTS5 index")
+            except Exception:
+                pass  # FTS already populated or table just created
 
     # ── Embeddings ──
 
@@ -106,6 +143,7 @@ class MemorySearch:
             conn.execute("INSERT INTO memories (source_type,source_id,title,content,embedding,created_at) "
                          "VALUES (?,?,?,?,?,?)", (source_type, source_id, title, content, blob, time.time()))
             conn.commit()
+            self._matrix_dirty = True
             return True
         finally:
             conn.close()
@@ -156,88 +194,137 @@ class MemorySearch:
             sections.append((heading, "\n".join(lines).strip()))
         return sections
 
+    # ── Embedding matrix ──
+
+    def _rebuild_embedding_matrix(self) -> None:
+        """Load all embeddings from SQLite into a single normalized (n, dim) matrix."""
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            rows = conn.execute(
+                "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            self._embedding_matrix = None
+            self._embedding_ids = []
+            self._matrix_dirty = False
+            return
+
+        ids: list[int] = []
+        vecs: list[np.ndarray] = []
+        for row_id, blob in rows:
+            vec = np.frombuffer(blob, dtype=np.float32).copy()
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            ids.append(row_id)
+            vecs.append(vec)
+
+        self._embedding_matrix = np.stack(vecs)  # (n, dim)
+        self._embedding_ids = ids
+        self._matrix_dirty = False
+
     # ── Search ──
 
     def search(self, query: str, top_k: int | None = None) -> list[MemoryResult]:
         """Hybrid search: vector similarity + keyword matching merged via RRF."""
         if top_k is None:
             top_k = self.top_k
-        conn = sqlite3.connect(str(self.db_path))
-        try:
-            rows = conn.execute(
-                "SELECT id, source_type, source_id, title, content, embedding FROM memories"
-            ).fetchall()
-        finally:
-            conn.close()
-        if not rows:
-            return []
 
-        candidate_k = min(2 * top_k, len(rows))
-        vector_ranked = self._vector_search(query, rows, candidate_k)
-        keyword_ranked = self._keyword_search(query, rows, candidate_k)
-        return self._rrf_merge(vector_ranked, keyword_ranked, rows, top_k)
+        candidate_k = 2 * top_k
+        vector_ranked = self._vector_search(query, candidate_k)
+        keyword_ranked = self._keyword_search(query, candidate_k)
+        return self._rrf_merge(vector_ranked, keyword_ranked, top_k)
 
-    def _vector_search(self, query: str, rows: list, top_k: int) -> list[tuple[int, float]]:
+    def _vector_search(self, query: str, top_k: int) -> list[tuple[int, float]]:
+        """Return top-k (row_id, cosine_similarity) via matrix-vector multiply."""
         query_vec = self._get_embedding(query)
         if query_vec is None:
             return []
-        scores = []
-        for idx, row in enumerate(rows):
-            if row[5] is None:
-                continue
-            doc_vec = np.frombuffer(row[5], dtype=np.float32).copy()
-            dot = float(np.dot(query_vec, doc_vec))
-            norm = float(np.linalg.norm(query_vec) * np.linalg.norm(doc_vec))
-            scores.append((idx, dot / norm if norm > 0 else 0.0))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_k]
 
-    def _keyword_search(self, query: str, rows: list, top_k: int) -> list[tuple[int, float]]:
-        query_tokens = _tokenize(query)
-        if not query_tokens:
+        if self._matrix_dirty:
+            self._rebuild_embedding_matrix()
+
+        if self._embedding_matrix is None or len(self._embedding_ids) == 0:
             return []
-        query_counts = Counter(query_tokens)
-        num_docs = len(rows)
 
-        doc_freq: Counter = Counter()
-        doc_tokens_list: list[list[str]] = []
-        for row in rows:
-            tokens = _tokenize(f"{row[3]} {row[4]}")
-            doc_tokens_list.append(tokens)
-            for t in set(tokens):
-                doc_freq[t] += 1
+        # Normalize query vector
+        qnorm = np.linalg.norm(query_vec)
+        if qnorm > 0:
+            query_vec = query_vec / qnorm
 
-        scores = []
-        for idx, tokens in enumerate(doc_tokens_list):
-            if not tokens:
-                scores.append((idx, 0.0))
-                continue
-            tc = Counter(tokens)
-            s = 0.0
-            for term, qf in query_counts.items():
-                tf = tc.get(term, 0)
-                if tf == 0:
-                    continue
-                idf = math.log((num_docs + 1) / (doc_freq.get(term, 1) + 1)) + 1
-                s += qf * (tf * 2.0) / (tf + 1.5) * idf  # BM25-lite
-            scores.append((idx, s))
-        scores.sort(key=lambda x: x[1], reverse=True)
-        return scores[:top_k]
+        # Single matrix-vector multiply: all cosine similarities at once
+        scores = self._embedding_matrix @ query_vec  # (n,)
+
+        # Efficient top-k via argpartition (avoids full sort)
+        k = min(top_k, len(scores))
+        if k <= 0:
+            return []
+        top_indices = np.argpartition(scores, -k)[-k:]
+        top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+
+        return [(self._embedding_ids[i], float(scores[i])) for i in top_indices]
+
+    def _keyword_search(self, query: str, top_k: int) -> list[tuple[int, float]]:
+        """Return top-k (row_id, bm25_score) using FTS5 MATCH."""
+        # Sanitize: remove FTS5 special characters
+        sanitized = _FTS5_SPECIAL.sub(" ", query).strip()
+        if not sanitized:
+            return []
+
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            # FTS5 rank column is negative BM25 (lower = better match),
+            # so we negate it to get a positive score and ORDER BY rank (ascending)
+            rows = conn.execute(
+                "SELECT rowid, -rank FROM memories_fts WHERE memories_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (sanitized, top_k),
+            ).fetchall()
+            return [(row_id, score) for row_id, score in rows]
+        except sqlite3.OperationalError:
+            # Query produced no valid FTS tokens (e.g. all stop words)
+            return []
+        finally:
+            conn.close()
 
     def _rrf_merge(self, vector_ranked: list[tuple[int, float]],
-                   keyword_ranked: list[tuple[int, float]], rows: list,
+                   keyword_ranked: list[tuple[int, float]],
                    top_k: int, k: int = 60) -> list[MemoryResult]:
+        """Merge results by Reciprocal Rank Fusion, then fetch only needed rows."""
         rrf: dict[int, float] = {}
-        for rank, (idx, _) in enumerate(vector_ranked):
-            rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (k + rank + 1)
-        for rank, (idx, _) in enumerate(keyword_ranked):
-            rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (k + rank + 1)
+        for rank, (row_id, _) in enumerate(vector_ranked):
+            rrf[row_id] = rrf.get(row_id, 0.0) + 1.0 / (k + rank + 1)
+        for rank, (row_id, _) in enumerate(keyword_ranked):
+            rrf[row_id] = rrf.get(row_id, 0.0) + 1.0 / (k + rank + 1)
         if not rrf:
             return []
+
+        # Pick top-k row IDs by RRF score
+        top_items = sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        top_ids = [row_id for row_id, _ in top_items]
+        score_map = {row_id: score for row_id, score in top_items}
+
+        # Fetch only those rows from SQLite
+        placeholders = ",".join("?" for _ in top_ids)
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            rows = conn.execute(
+                f"SELECT id, source_type, source_id, title, content FROM memories "
+                f"WHERE id IN ({placeholders})",
+                top_ids,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        row_map = {r[0]: r for r in rows}
         results = []
-        for idx, score in sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:top_k]:
-            row = rows[idx]
-            results.append(MemoryResult(row[1], row[2], row[3], row[4], round(score, 6)))
+        for row_id in top_ids:
+            r = row_map.get(row_id)
+            if r:
+                results.append(MemoryResult(r[1], r[2], r[3], r[4], round(score_map[row_id], 6)))
         return results
 
     # ── Async wrappers ──
@@ -266,11 +353,6 @@ class MemorySearch:
 
 
 # ── Utilities ──
-
-def _tokenize(text: str) -> list[str]:
-    return [t for t in re.sub(r"[^a-z0-9\s]", " ", text.lower()).split()
-            if len(t) > 1 and t not in _STOP_WORDS]
-
 
 def _slugify(text: str) -> str:
     return re.sub(r"[\s-]+", "_", re.sub(r"[^a-z0-9\s-]", "", text.lower().strip()))[:80]

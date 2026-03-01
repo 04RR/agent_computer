@@ -5,6 +5,7 @@ format, which OpenRouter supports across all tool-capable models.
 """
 
 from __future__ import annotations
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field
@@ -61,9 +62,16 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, Tool] = {}
+        self._accepts_context: dict[str, bool] = {}  # cached signature checks
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
+        # Cache whether this handler accepts _context
+        try:
+            sig = inspect.signature(tool.handler)
+            self._accepts_context[tool.name] = "_context" in sig.parameters
+        except (ValueError, TypeError):
+            self._accepts_context[tool.name] = False
         logger.info(f"Registered tool: {tool.name}")
 
     def get(self, name: str) -> Tool | None:
@@ -84,14 +92,22 @@ class ToolRegistry:
             if name in self._tools:
                 self._tools[name].require_approval = True
 
-    async def execute(self, name: str, params: dict[str, Any]) -> str:
-        """Execute a tool by name. Returns result as string."""
+    async def execute(self, name: str, params: dict[str, Any],
+                      context: dict[str, Any] | None = None) -> str:
+        """Execute a tool by name. Returns result as string.
+
+        If the tool handler accepts a ``_context`` keyword argument and
+        *context* is provided, it will be forwarded automatically.
+        """
         tool = self._tools.get(name)
         if not tool:
             return json.dumps({"error": f"Unknown tool: {name}"})
 
         try:
-            result = await tool.handler(**params)
+            if context is not None and self._accepts_context.get(name, False):
+                result = await tool.handler(**params, _context=context)
+            else:
+                result = await tool.handler(**params)
             return result if isinstance(result, str) else json.dumps(result)
         except Exception as e:
             logger.error(f"Tool {name} failed: {e}")

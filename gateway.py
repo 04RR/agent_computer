@@ -503,15 +503,23 @@ async def root():
 # ─── Entry point ───
 
 def main():
+    provider = config.agent.model.provider
     api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
+
+    if provider == "lmstudio":
+        # LM Studio uses its own base_url and api_key from config
+        agent.client.api_key = config.lmstudio.api_key
+        if api_key:
+            agent._openrouter_api_key = api_key
+        logger.info("Using LM Studio as provider (OPENROUTER_API_KEY is optional)")
+    elif api_key:
+        agent.client.api_key = api_key
+    else:
         logger.error("OPENROUTER_API_KEY environment variable not set!")
         logger.error("Get your key at https://openrouter.ai/keys")
         logger.error("Then: export OPENROUTER_API_KEY=sk-or-...")
+        logger.error("Or switch to LM Studio by setting provider to 'lmstudio' in config.json")
         return
-
-    # Patch the agent's client with the real key
-    agent.client.api_key = api_key
 
     logger.info(f"Starting agent_computer Gateway on {config.gateway.host}:{config.gateway.port}")
     logger.info(f"Agent: {config.agent.name}")

@@ -7,19 +7,6 @@ import os
 from pathlib import Path
 
 from tool_registry import Tool, ToolParam, ToolRegistry
-from task_store import TaskStore
-
-# ─── Module-level task store binding ───
-# Safe because sessions use async locks (serial execution per session).
-_current_task_store: TaskStore | None = None
-_current_mode: str = "bounded"
-
-
-def set_current_task_store(store: TaskStore | None, mode: str = "bounded") -> None:
-    """Bind the active session's task store for the manage_tasks tool."""
-    global _current_task_store, _current_mode
-    _current_task_store = store
-    _current_mode = mode
 
 
 def register_builtin_tools(registry: ToolRegistry, workspace: str) -> None:
@@ -187,11 +174,15 @@ def register_task_tool(registry: ToolRegistry) -> None:
 
     async def manage_tasks(action: str, task_id: int | None = None, title: str | None = None,
                            description: str | None = None, status: str | None = None,
-                           parent_id: int | None = None, result: str | None = None) -> str:
-        if _current_mode != "deep_work":
+                           parent_id: int | None = None, result: str | None = None,
+                           _context: dict | None = None) -> str:
+        ctx = _context or {}
+        mode = ctx.get("mode", "bounded")
+        store = ctx.get("task_store")
+
+        if mode != "deep_work":
             return json.dumps({"error": "Task management not available in bounded mode. Switch to deep work mode to use tasks."})
 
-        store = _current_task_store
         if store is None:
             return json.dumps({"error": "No task store available"})
 

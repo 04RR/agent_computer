@@ -29,3 +29,6 @@ workspace/
 .env
 
 config.json
+
+start_gateway.bat
+start_gateway.sh

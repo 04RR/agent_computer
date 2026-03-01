@@ -13,7 +13,7 @@ and cloud models via **OpenRouter**.
 - **Workspace** — Identity files (SOUL.md, USER.md) and agent memory
 - **Deep Work Mode** — Extended autonomous execution with task decomposition, auto-compaction, and token budgets
 - **Reflection Engine** — Extracts knowledge, learnings, and reusable skills from completed sessions
-- **Memory Search** — Hybrid vector + keyword search (BM25 + cosine similarity via Reciprocal Rank Fusion)
+- **Memory Search** — Hybrid vector + keyword search (SQLite FTS5 BM25 + vectorized cosine similarity via Reciprocal Rank Fusion)
 - **Cron Scheduler** — Scheduled agent tasks that run on a timer or at startup
 - **Skill Loader** — Auto-discovered Python skills registered as tools at runtime
 
@@ -102,14 +102,14 @@ agent_computer/
 ├── gateway.py            # FastAPI gateway (entry point)
 ├── agent.py              # Agent runtime + agentic loop
 ├── session.py            # Session management, JSONL persistence, compaction
-├── tool_registry.py      # Tool registration and execution
+├── tool_registry.py      # Tool registration and execution (with per-call context passing)
 ├── context.py            # System prompt assembly from workspace files
 ├── config.py             # Configuration loader with defaults
 ├── config.json           # Runtime configuration
 ├── task_store.py         # Task management for deep work mode
 ├── cron.py               # Cron scheduler (scheduled agent tasks)
 ├── reflection.py         # Auto-reflection engine (knowledge extraction)
-├── memory_search.py      # Hybrid vector + keyword memory search (SQLite)
+├── memory_search.py      # Hybrid memory search (FTS5 + vectorized NumPy, SQLite)
 ├── skill_loader.py       # Dynamic skill loader from Python files
 ├── tools/
 │   ├── __init__.py       # Built-in tools (shell, files, tasks, memory)
@@ -122,7 +122,7 @@ agent_computer/
 │       ├── knowledge.md  # Extracted knowledge from sessions
 │       ├── learnings.md  # Extracted learnings (mistake → correction)
 │       ├── index.json    # Reflection processing index
-│       ├── memory.db     # SQLite vector + keyword search index
+│       ├── memory.db     # SQLite DB (memories table + FTS5 index + embeddings)
 │       └── skills/       # Auto-extracted reusable Python skills
 ├── sessions/             # JSONL session transcripts (auto-created)
 ├── web/
@@ -155,6 +155,37 @@ curl -X POST http://localhost:8000/api/chat/my-session \
   -H "Content-Type: application/json" \
   -d '{"message": "Research and compile a report on...", "mode": "deep_work"}'
 ```
+
+## Architecture Notes
+
+### Tool Context Passing
+
+Tool execution uses explicit context passing instead of global state. When the
+agent loop runs, it builds a `tool_context` dict containing the session's task
+store, mode, and session ID. The `ToolRegistry.execute()` method accepts an
+optional `context` parameter and forwards it to any tool handler that declares a
+`_context` keyword argument (detected once at registration via `inspect.signature`
+and cached). This eliminates shared mutable globals and makes concurrent sessions
+safe.
+
+### Memory Search Internals
+
+`MemorySearch` uses two complementary search strategies merged via Reciprocal
+Rank Fusion (RRF):
+
+- **Keyword search** — SQLite FTS5 virtual table (`memories_fts`) kept in sync
+  with the `memories` table via INSERT/DELETE/UPDATE triggers. Queries use the
+  built-in BM25 ranking (`rank` column). A one-time backfill populates FTS from
+  pre-existing rows on first init.
+
+- **Vector search** — All embeddings are loaded into a single pre-normalized
+  `(n, dim)` NumPy matrix. Cosine similarities are computed in one matrix-vector
+  multiply, with top-k selection via `np.argpartition` (O(n) instead of
+  O(n log n) full sort). The matrix is rebuilt lazily when `_matrix_dirty` is set
+  (after `index_text()`).
+
+The RRF merge step fetches only the final top-k rows from SQLite by ID, avoiding
+loading the entire table into Python.
 
 ## Tools
 
