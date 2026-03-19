@@ -93,7 +93,7 @@ class Config(BaseModel):
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     pinchtab: PinchTabConfig = Field(default_factory=PinchTabConfig)
-    openrouter_api_key: str = "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"
+    openrouter_api_key: str = "ADD_KEY_HERE"
 
 
 def load_config(path: str = "config.json") -> Config:
