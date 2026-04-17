@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from task_store import TaskStore
 
@@ -64,6 +64,9 @@ class Message:
 class Session:
     """A single conversation session with JSONL persistence and serial execution."""
 
+    VALID_MODES: ClassVar[set[str]] = {"bounded", "deep_work"}
+    VALID_PHASES: ClassVar[set[str | None]] = {None, "planning", "executing"}
+
     def __init__(self, session_id: str, storage_dir: str):
         self.session_id = session_id
         self.messages: list[Message] = []
@@ -99,6 +102,26 @@ class Session:
             logger.info(f"Loaded session {self.session_id}: {len(self.messages)} messages")
         except Exception as e:
             logger.error(f"Failed to load session {self.session_id}: {e}")
+
+    def set_mode(self, mode: str) -> None:
+        """Switch mode. Resets deep_work_phase to None."""
+        if mode not in self.VALID_MODES:
+            raise ValueError(f"Invalid mode: {mode}")
+        self.mode = mode
+        self.deep_work_phase = None
+
+    def begin_deep_work_if_needed(self) -> None:
+        """Called at the start of a deep_work run. Sets phase to 'planning' if unset."""
+        if self.mode == "deep_work" and self.deep_work_phase is None:
+            self.deep_work_phase = "planning"
+
+    def approve_plan(self) -> None:
+        """Transition planning → executing. Raises if not in valid state."""
+        if self.mode != "deep_work":
+            raise ValueError("Cannot approve plan outside deep_work mode")
+        if self.deep_work_phase != "planning":
+            raise ValueError(f"Cannot approve plan from phase {self.deep_work_phase!r}")
+        self.deep_work_phase = "executing"
 
     def _persist(self, message: Message) -> None:
         self._write_buffer.append(message.to_jsonl() + "\n")

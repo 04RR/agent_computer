@@ -9,7 +9,7 @@
     "workspace": "./workspace",
     "model": {
       "provider": "lmstudio",
-      "model_id": "mistralai/ministral-3-14b-reasoning",
+      "model_id": "google/gemma-4-26b-a4b",
       "base_url": "http://100.127.32.115:1234/v1",
       "max_tokens": 8192
     },
@@ -22,6 +22,7 @@
         "web_fetch",
         "web_fetch_js",
         "web_fetch_stealth",
+        "web_search",
         "manage_tasks",
         "memory_search"
       ],

@@ -250,25 +250,102 @@
   }
   .tool-event.expanded pre { display: block; }
 
-  /* Thinking indicator */
-  .thinking {
+  /* Activity panel — grouped per-iteration log */
+  .activity-panel {
     align-self: flex-start;
-    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-width: 85%;
     font-size: 12px;
+    overflow: hidden;
+  }
+  .activity-panel.collapsed .activity-body { display: none; }
+  .activity-panel.collapsed .activity-header .ap-toggle { transform: rotate(-90deg); }
+  .activity-header {
+    padding: 8px 12px;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+    background: var(--surface2);
   }
-  .thinking .dots span {
-    display: inline-block;
-    width: 4px; height: 4px;
+  .activity-header:hover { background: var(--border); }
+  .ap-toggle {
+    color: var(--text-dim);
+    font-size: 10px;
+    transition: transform 0.15s;
+  }
+  .ap-title {
+    flex: 1;
+    color: var(--text);
+    font-weight: 500;
+  }
+  .ap-elapsed {
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .ap-status-dot {
+    width: 6px; height: 6px;
     border-radius: 50%;
-    background: var(--text-dim);
-    animation: blink 1.4s infinite both;
+    background: var(--yellow);
+    animation: pulse 1.2s infinite ease-in-out;
   }
-  .thinking .dots span:nth-child(2) { animation-delay: 0.2s; }
-  .thinking .dots span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+  .ap-status-dot.done { background: var(--green); animation: none; }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  .activity-body {
+    padding: 6px 12px 10px 28px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .ap-line {
+    padding: 2px 0;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .ap-line .ap-marker {
+    color: var(--border);
+    width: 10px;
+    flex-shrink: 0;
+  }
+  .ap-line.in-progress .ap-marker { color: var(--yellow); }
+  .ap-line.done .ap-marker { color: var(--green); }
+  .ap-line .ap-text {
+    flex: 1;
+  }
+  .ap-line .ap-expand {
+    color: var(--text-dim);
+    font-size: 10px;
+    transition: transform 0.15s;
+  }
+  .ap-line.expanded .ap-expand {
+    transform: rotate(90deg);
+  }
+  .ap-line.ap-tool {
+    padding: 4px 0;
+    flex-wrap: wrap;
+  }
+  .ap-line .ap-detail {
+    display: none;
+    width: 100%;
+    margin-top: 4px;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    max-height: 200px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .ap-line.expanded .ap-detail { display: block; }
 
   /* ── Input area ── */
   #input-area {
@@ -1122,7 +1199,11 @@ localStorage.setItem('agent_computer_session', sessionId);
 
 let ws = null;
 let busy = false;
-let currentThinking = null;
+let currentActivityPanel = null;
+let currentIteration = -1;
+let panelStartTime = 0;
+let panelTimerInterval = null;
+let currentPhaseLine = null;
 let currentAssistant = null;
 let currentView = 'chat';
 let currentTimeRange = 'all';
@@ -1201,23 +1282,38 @@ function connect() {
 function handleEvent(data) {
   switch (data.type) {
     case 'thinking': {
-      removeThinking();
-      let thinkText;
-      if (currentMode === 'deep_work' && data.max_iterations) {
-        const tokensK = data.tokens_used ? Math.round(data.tokens_used / 1000) : 0;
-        const phaseLabel = deepWorkPhase === 'executing' ? 'Executing' : 'Planning';
-        thinkText = `${phaseLabel} \u00b7 Step ${data.iteration}/${data.max_iterations} | ${tokensK}k tokens`;
-        updateExecPhase(phaseLabel);
+      const iter = data.iteration;
+      const phase = data.phase;
+
+      if (!phase) {
+        // Iteration header event (existing shape from top of loop)
+        ensurePanel(iter, data);
       } else {
-        thinkText = `Thinking (step ${data.iteration})...`;
+        // Sub-phase event — ensure panel exists, then add a line
+        ensurePanel(iter, data);
+        addActivityLine(phaseLabel(phase, data), 'in-progress');
+        if (phase === 'memory_search_done' || phase === 'llm_response') {
+          // These are terminal phase events, mark done immediately
+          if (currentPhaseLine) {
+            currentPhaseLine.classList.remove('in-progress');
+            currentPhaseLine.classList.add('done');
+            const marker = currentPhaseLine.querySelector('.ap-marker');
+            if (marker) marker.textContent = '└─';
+            currentPhaseLine = null;
+          }
+        }
       }
-      currentThinking = addThinking(thinkText);
+
+      if (currentMode === 'deep_work' && data.max_iterations) {
+        const phaseLbl = deepWorkPhase === 'executing' ? 'Executing' : 'Planning';
+        updateExecPhase(phaseLbl);
+      }
       currentAssistant = null;
       break;
     }
 
     case 'text':
-      removeThinking();
+      finalizeCurrentPanel();
       if (!currentAssistant) {
         currentAssistantRawText = data.text;
         currentAssistant = addMessage('assistant', data.text);
@@ -1229,15 +1325,14 @@ function handleEvent(data) {
       break;
 
     case 'tool_call': {
-      removeThinking();
       const inputStr = JSON.stringify(data.input, null, 2);
-      addToolEvent('call', data.tool, inputStr);
+      addToolLine('call', data.tool, inputStr);
       break;
     }
 
     case 'tool_result': {
       const durationStr = data.duration_ms != null ? `${data.duration_ms}ms` : '';
-      addToolEvent('result', data.tool, data.result_preview, durationStr);
+      addToolLine('result', data.tool, data.result_preview, durationStr);
       break;
     }
 
@@ -1247,7 +1342,7 @@ function handleEvent(data) {
       break;
 
     case 'plan_ready':
-      removeThinking();
+      finalizeCurrentPanel();
       deepWorkPhase = 'awaiting_approval';
       updateExecPhase('Awaiting Approval');
       showPlanCard(data.text, data.tasks || []);
@@ -1269,7 +1364,7 @@ function handleEvent(data) {
       break;
 
     case 'done':
-      removeThinking();
+      finalizeCurrentPanel();
       busy = false;
       sendBtn.disabled = false;
       currentAssistantRawText = '';
@@ -1286,7 +1381,7 @@ function handleEvent(data) {
       break;
 
     case 'error':
-      removeThinking();
+      finalizeCurrentPanel();
       addSystem(`Error: ${data.message}`);
       busy = false;
       sendBtn.disabled = false;
@@ -1372,20 +1467,179 @@ function addToolEvent(kind, toolName, detail, duration) {
   scrollToBottom();
 }
 
-function addThinking(text) {
-  const div = document.createElement('div');
-  div.className = 'thinking';
-  div.innerHTML = `<span class="dots"><span></span><span></span><span></span></span> ${escapeHtml(text)}`;
-  chatEl.appendChild(div);
-  scrollToBottom();
-  return div;
+// ─── Activity panel manager ───
+
+function phaseLabel(phase, data) {
+  switch (phase) {
+    case 'memory_search': return 'Searching memory';
+    case 'memory_search_done':
+      return `Memory search: ${data.count || 0} matches`;
+    case 'llm_call':
+      const shortModel = (data.model || 'model').split('/').pop();
+      const tokens = data.prompt_tokens_estimate ? ` (${formatNumber(data.prompt_tokens_estimate)} tokens in)` : '';
+      return `Calling ${shortModel}${tokens}`;
+    case 'llm_response':
+      const out = data.response_tokens ? ` (${formatNumber(data.response_tokens)} tokens out)` : '';
+      return `Received response${out}`;
+    default: return phase;
+  }
 }
 
-function removeThinking() {
-  if (currentThinking) {
-    currentThinking.remove();
-    currentThinking = null;
+function ensurePanel(iteration, data) {
+  if (currentActivityPanel && currentIteration !== iteration) {
+    finalizeCurrentPanel();
   }
+
+  if (!currentActivityPanel) {
+    const panel = document.createElement('div');
+    panel.className = 'activity-panel';
+
+    let titleText;
+    if (iteration === 0) {
+      titleText = 'Preparing';
+    } else if (currentMode === 'deep_work' && data && data.max_iterations) {
+      const phaseLbl = deepWorkPhase === 'executing' ? 'Executing' : 'Planning';
+      const tokensK = data.tokens_used ? Math.round(data.tokens_used / 1000) : 0;
+      titleText = `${phaseLbl} \u00b7 Step ${iteration}/${data.max_iterations} \u00b7 ${tokensK}k tokens`;
+    } else {
+      titleText = `Thinking \u00b7 Step ${iteration}`;
+    }
+
+    panel.innerHTML = `
+      <div class="activity-header" onclick="this.parentElement.classList.toggle('collapsed')">
+        <span class="ap-toggle">\u25bc</span>
+        <span class="ap-status-dot"></span>
+        <span class="ap-title">${escapeHtml(titleText)}</span>
+        <span class="ap-elapsed">00:00</span>
+      </div>
+      <div class="activity-body"></div>
+    `;
+    chatEl.appendChild(panel);
+    scrollToBottom();
+
+    currentActivityPanel = panel;
+    currentIteration = iteration;
+    panelStartTime = Date.now();
+    currentPhaseLine = null;
+
+    if (panelTimerInterval) clearInterval(panelTimerInterval);
+    panelTimerInterval = setInterval(updateElapsed, 1000);
+  }
+  return currentActivityPanel;
+}
+
+function updateElapsed() {
+  if (!currentActivityPanel) return;
+  const elapsed = Math.floor((Date.now() - panelStartTime) / 1000);
+  const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+  const ss = String(elapsed % 60).padStart(2, '0');
+  const el = currentActivityPanel.querySelector('.ap-elapsed');
+  if (el) el.textContent = `${mm}:${ss}`;
+}
+
+function addToolLine(kind, toolName, detail, duration) {
+  if (!currentActivityPanel) {
+    ensurePanel(currentIteration >= 0 ? currentIteration : 1, {});
+  }
+  const body = currentActivityPanel.querySelector('.activity-body');
+
+  // Mark previous in-progress line done
+  if (currentPhaseLine) {
+    currentPhaseLine.classList.remove('in-progress');
+    currentPhaseLine.classList.add('done');
+    const m = currentPhaseLine.querySelector('.ap-marker');
+    if (m) m.textContent = '>';
+  }
+
+  const isResult = kind === 'result';
+  const state = isResult ? 'done' : 'in-progress';
+  const label = isResult
+    ? `${toolName} completed${duration ? ' (' + duration + ')' : ''}`
+    : `Calling ${toolName}`;
+
+  const line = document.createElement('div');
+  line.className = `ap-line ap-tool ${state}`;
+  line.innerHTML = `
+    <span class="ap-marker">${isResult ? '>' : '>'}</span>
+    <span class="ap-text">${escapeHtml(label)}</span>
+    ${detail ? '<span class="ap-expand">\u25b8</span>' : ''}
+  `;
+
+  if (detail) {
+    const pre = document.createElement('pre');
+    pre.className = 'ap-detail';
+    pre.textContent = detail;
+    line.appendChild(pre);
+    line.style.cursor = 'pointer';
+    line.onclick = (e) => {
+      if (e.target.tagName === 'PRE') return;
+      line.classList.toggle('expanded');
+    };
+  }
+
+  body.appendChild(line);
+  scrollToBottom();
+
+  if (!isResult) {
+    currentPhaseLine = line;
+  } else {
+    currentPhaseLine = null;
+  }
+}
+
+function addActivityLine(text, state) {
+  if (!currentActivityPanel) return null;
+  const body = currentActivityPanel.querySelector('.activity-body');
+
+  if (currentPhaseLine) {
+    currentPhaseLine.classList.remove('in-progress');
+    currentPhaseLine.classList.add('done');
+    const marker = currentPhaseLine.querySelector('.ap-marker');
+    if (marker) marker.textContent = '\u2514\u2500';
+  }
+
+  const line = document.createElement('div');
+  line.className = `ap-line ${state || 'in-progress'}`;
+  line.innerHTML = `<span class="ap-marker">-</span><span>${escapeHtml(text)}</span>`;
+  body.appendChild(line);
+  scrollToBottom();
+
+  if (state === 'in-progress' || !state) {
+    currentPhaseLine = line;
+  } else {
+    currentPhaseLine = null;
+  }
+  return line;
+}
+
+function finalizeCurrentPanel() {
+  if (!currentActivityPanel) return;
+  if (panelTimerInterval) {
+    clearInterval(panelTimerInterval);
+    panelTimerInterval = null;
+  }
+  updateElapsed();
+  const dot = currentActivityPanel.querySelector('.ap-status-dot');
+  if (dot) dot.classList.add('done');
+  if (currentPhaseLine) {
+    currentPhaseLine.classList.remove('in-progress');
+    currentPhaseLine.classList.add('done');
+    const marker = currentPhaseLine.querySelector('.ap-marker');
+    if (marker) marker.textContent = '>';
+  }
+
+  // Build summary of what happened in this panel (tool calls executed)
+  const toolLines = currentActivityPanel.querySelectorAll('.ap-line.ap-tool.done');
+  const toolCount = toolLines.length;
+  const title = currentActivityPanel.querySelector('.ap-title');
+  if (title && toolCount > 0) {
+    title.textContent += ` \u00b7 ${toolCount} tool call${toolCount > 1 ? 's' : ''}`;
+  }
+
+  currentActivityPanel.classList.add('collapsed');
+  currentActivityPanel = null;
+  currentIteration = -1;
+  currentPhaseLine = null;
 }
 
 function scrollToBottom() {
@@ -1448,7 +1702,7 @@ async function switchSession(newSessionId) {
   busy = false;
   sendBtn.disabled = false;
   currentAssistant = null;
-  currentThinking = null;
+  finalizeCurrentPanel();
 
   try {
     const resp = await fetch(`/api/sessions/${sessionId}/history`);
@@ -1506,7 +1760,7 @@ function newSession() {
   busy = false;
   sendBtn.disabled = false;
   currentAssistant = null;
-  currentThinking = null;
+  finalizeCurrentPanel();
   // Reset mode and clear stale task panel from previous session
   currentMode = 'bounded';
   deepWorkPhase = null;

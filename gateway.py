@@ -27,7 +27,7 @@ import uvicorn
 
 from config import load_config
 from agent import AgentRuntime, subscribe_activity, unsubscribe_activity, get_recent_activity
-from session import SessionManager
+from session import Session, SessionManager
 from tool_registry import ToolRegistry
 from tools import register_builtin_tools, register_task_tool, register_memory_search_tool
 from cron import CronScheduler
@@ -63,6 +63,8 @@ register_builtin_tools(tool_registry, config.agent.workspace, allowed=allowed_to
 register_task_tool(tool_registry, allowed=allowed_tools)
 from tools.web_scrapling import register_scrapling_tools
 register_scrapling_tools(tool_registry, config.agent.workspace, allowed=allowed_tools)
+from tools.web_search import register_web_search_tool
+register_web_search_tool(tool_registry, allowed=allowed_tools)
 if config.pinchtab.enabled:
     from tools.pinchtab import register_pinchtab_tools
     register_pinchtab_tools(tool_registry, config.agent.workspace, allowed=allowed_tools, pinchtab_config=config.pinchtab)
@@ -248,7 +250,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif data.get("type") == "approve_plan":
                 # User approved the plan — transition to execution phase
-                session.deep_work_phase = "executing"
+                try:
+                    session.approve_plan()
+                except ValueError as e:
+                    await websocket.send_json({"type": "error", "message": str(e)})
+                    continue
                 feedback = data.get("feedback", "")
                 approval_msg = "[PLAN APPROVED] Execute the plan now."
                 if feedback:
@@ -276,13 +282,8 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             elif data.get("type") == "set_mode":
                 new_mode = data.get("mode", "bounded")
-                if new_mode in ("bounded", "deep_work"):
-                    session.mode = new_mode
-                    # Reset phase when mode changes
-                    if new_mode == "bounded":
-                        session.deep_work_phase = None
-                    elif session.deep_work_phase is None:
-                        session.deep_work_phase = None  # Will be set on first message
+                if new_mode in Session.VALID_MODES:
+                    session.set_mode(new_mode)
                     await websocket.send_json({
                         "type": "mode_changed",
                         "mode": new_mode,
@@ -494,7 +495,7 @@ async def get_openrouter_models(api_key: str, max_age_seconds: int = 3600) -> li
 
 _PINNED_MODELS = [
     {"id": "z-ai/glm-5", "name": "GLM-5", "provider": "openrouter"},
-    {"id": "qwen/qwen3.5-35b-a3b", "name": "Qwen 3.5 35B A3B", "provider": "lmstudio"},
+    {"id": "qwen/qwen3.6-35b-a3b", "name": "Qwen 3.6 35B A3B", "provider": "lmstudio"},
 ]
 
 

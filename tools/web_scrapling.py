@@ -50,7 +50,7 @@ def register_scrapling_tools(registry: ToolRegistry, workspace: str, allowed: li
     if allowed is None or "web_fetch" in allowed:
         registry.register(Tool(
             name="web_fetch",
-            description="Fetch a URL via HTTP with browser TLS impersonation. Fast, no JS rendering. Best for reading pages, fetching data, API calls. For interactive tasks (clicking, filling forms, multi-step workflows), use the browser_* tools instead.",
+            description="Fast HTTP fetch with browser TLS impersonation. Returns raw HTML only — does NOT execute JavaScript.\n\nUSE for: static HTML pages, APIs, text-based sites (wttr.in, arxiv.org, plain documentation), GitHub search pages (github.com/search), raw README files.\n\nDO NOT USE for sites where data is JavaScript-rendered. These include: GitHub repo pages (star counts, issue counts), Reddit, Twitter/X, LinkedIn, Claude.com pricing, OpenAI pricing, AccuWeather, weather.com, Google Search. Those require web_fetch_js.\n\nAlso DO NOT USE google.com/search — Google blocks non-browser clients from this environment. Use the web_search tool instead.",
             params=[
                 ToolParam("url", "string", "The URL to fetch"),
                 ToolParam("css_selector", "string", "CSS selector to extract specific elements", required=False),
@@ -79,7 +79,7 @@ def register_scrapling_tools(registry: ToolRegistry, workspace: str, allowed: li
     if allowed is None or "web_fetch_js" in allowed:
         registry.register(Tool(
             name="web_fetch_js",
-            description="Fetch a URL with a full browser for JS rendering. Use for dynamic sites (Reddit, YouTube, Google). Slower but renders JS content.",
+            description="Full browser rendering with JavaScript execution. Slower (5-10s) but retrieves dynamic content.\n\nUSE for: GitHub repo pages (to get star counts, commit dates), Reddit threads, Twitter/X, LinkedIn, Claude/OpenAI/Anthropic pricing pages, AccuWeather, weather.com, or any site where key data is rendered by JavaScript rather than present in raw HTML.\n\nDO NOT USE for google.com/search — Google has its own bot detection that blocks even full browsers from this network. Use the web_search tool instead.",
             params=[
                 ToolParam("url", "string", "The URL to fetch"),
                 ToolParam("css_selector", "string", "CSS selector to extract specific elements", required=False),
@@ -108,7 +108,7 @@ def register_scrapling_tools(registry: ToolRegistry, workspace: str, allowed: li
     if allowed is None or "web_fetch_stealth" in allowed:
         registry.register(Tool(
             name="web_fetch_stealth",
-            description="Fetch a URL with a stealth browser that bypasses Cloudflare and bot detection. Use when other fetchers get blocked.",
+            description="Stealth browser with Cloudflare challenge bypass. Very slow (30-120s). Last resort.\n\nUSE ONLY when web_fetch_js fails with a Cloudflare challenge page. Not effective against Google's bot detection — do not use for google.com.",
             params=[
                 ToolParam("url", "string", "The URL to fetch"),
                 ToolParam("css_selector", "string", "CSS selector to extract specific elements", required=False),

@@ -20,7 +20,8 @@ from typing import Any, AsyncIterator
 from openai import AsyncOpenAI
 
 from config import Config
-from context import build_system_prompt, build_static_prompt_prefix, build_dynamic_suffix, load_static_context
+from context import PromptContext, build_system_prompt, build_static_prompt_prefix, build_dynamic_suffix, load_static_context
+from context_compactor import truncate_tool_results
 from session import Session
 from tool_registry import ToolRegistry
 
@@ -64,6 +65,11 @@ class AgentEvent:
     """Events emitted during the agent loop for streaming to clients."""
     type: str  # "thinking", "text", "tool_call", "tool_result", "error", "done", "task_update"
     data: dict[str, Any]
+
+
+def _estimate_prompt_tokens(messages: list[dict]) -> int:
+    """Cheap token estimate for UI display. ~4 chars per token."""
+    return sum(len(str(m.get("content", ""))) for m in messages) // 4
 
 
 class AgentRuntime:
@@ -130,10 +136,7 @@ class AgentRuntime:
         # 2. Determine limits based on mode and phase
         is_planning = False
         if is_deep_work:
-            # Auto-transition: first message in deep work → planning phase
-            if session.deep_work_phase is None:
-                session.deep_work_phase = "planning"
-
+            session.begin_deep_work_if_needed()
             is_planning = session.deep_work_phase == "planning"
 
             if is_planning:
@@ -169,6 +172,7 @@ class AgentRuntime:
         # 6. Search relevant memories for this user message (once per run)
         relevant_memories = None
         if self.memory_search:
+            yield AgentEvent("thinking", {"iteration": 0, "phase": "memory_search"})
             try:
                 results = await self.memory_search.async_search(user_message)
                 if results:
@@ -179,44 +183,37 @@ class AgentRuntime:
                     ]
             except Exception as e:
                 logger.warning(f"Memory search failed: {e}")
+            result_count = len(relevant_memories) if relevant_memories else 0
+            yield AgentEvent("thinking", {"iteration": 0, "phase": "memory_search_done", "count": result_count})
 
         session_summary = ""
 
-        # 7. Build system prompt — cache static prefix for deep work reuse
+        # 7. Build prompt context and system prompt — cache static prefix for deep work reuse
+        ctx = PromptContext(
+            workspace=self.agent_config.workspace,
+            agent_name=self.agent_config.name,
+            mode=effective_mode,
+            deep_work_phase=session.deep_work_phase,
+            relevant_memories=relevant_memories,
+            tool_names=tool_name_list,
+            soul_content=static_ctx["soul_content"],
+            user_content=static_ctx["user_content"],
+            static_memory_fallback=static_ctx["static_memory_fallback"],
+            max_iterations=max_iterations,
+            provider=self.agent_config.model.provider,
+            session_summary=session_summary,
+            user_message=user_message,
+        )
+
         if is_deep_work:
-            static_prefix = build_static_prompt_prefix(
-                workspace=self.agent_config.workspace,
-                agent_name=self.agent_config.name,
-                mode=effective_mode,
-                deep_work_phase=session.deep_work_phase,
-                relevant_memories=relevant_memories,
-                tool_names=tool_name_list,
-                session_summary=session_summary,
-                **static_ctx,
-            )
-            task_summary = session.task_store.summary()
-            pending_task_count = session.task_store.pending_count()
-            suffix = build_dynamic_suffix(
-                task_summary=task_summary,
-                pending_task_count=pending_task_count,
-            )
+            static_prefix = build_static_prompt_prefix(ctx)
+            ctx.task_summary = session.task_store.summary()
+            ctx.pending_task_count = session.task_store.pending_count()
+            suffix = build_dynamic_suffix(ctx)
             system_prompt = static_prefix + ("\n\n" + suffix if suffix else "")
         else:
             static_prefix = ""
-            task_summary = ""
-            pending_task_count = 0
-            system_prompt = build_system_prompt(
-                self.agent_config.workspace,
-                self.agent_config.name,
-                mode=effective_mode,
-                relevant_memories=relevant_memories,
-                user_message=user_message,
-                tool_names=tool_name_list,
-                session_summary=session_summary,
-                max_iterations=max_iterations,
-                provider=self.agent_config.model.provider,
-                **static_ctx,
-            )
+            system_prompt = build_system_prompt(ctx)
 
         # 8. Run the agentic loop
         iteration = 0
@@ -225,7 +222,6 @@ class AgentRuntime:
         consecutive_same_tool = 0
         last_tool_name: str | None = None
         run_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        context_file = ""  # Path to compacted context MD file (set after compaction)
         compaction_count = 0
         max_compactions = 5  # Safety cap — effectively 6x budget total
         compaction_threshold = 0.75
@@ -236,15 +232,15 @@ class AgentRuntime:
 
             # Deep work: rebuild dynamic suffix each iteration (static prefix is cached)
             if is_deep_work and iteration > 1:
-                task_summary = session.task_store.summary()
-                pending_task_count = session.task_store.pending_count()
-                budget_warning = ""
+                ctx.task_summary = session.task_store.summary()
+                ctx.pending_task_count = session.task_store.pending_count()
+                ctx.budget_warning = ""
                 if token_budget > 0:
                     usage_ratio = run_usage["total_tokens"] / token_budget
                     if usage_ratio >= warning_threshold:
                         pct = round(usage_ratio * 100)
                         remaining = token_budget - run_usage["total_tokens"]
-                        budget_warning = (
+                        ctx.budget_warning = (
                             f"WARNING: You have used {pct}% of your token budget "
                             f"({run_usage['total_tokens']:,}/{token_budget:,} tokens). "
                             f"{remaining:,} tokens remaining. "
@@ -254,24 +250,10 @@ class AgentRuntime:
                 if iteration % 10 == 0:
                     completed = session.task_store.completed_list()
                     if completed:
-                        session_summary = "Completed: " + "; ".join(t.title for t in completed[:20])
+                        ctx.session_summary = "Completed: " + "; ".join(t.title for t in completed[:20])
                         # Rebuild static prefix with updated session summary
-                        static_prefix = build_static_prompt_prefix(
-                            workspace=self.agent_config.workspace,
-                            agent_name=self.agent_config.name,
-                            mode=effective_mode,
-                            deep_work_phase=session.deep_work_phase,
-                            relevant_memories=relevant_memories,
-                            tool_names=tool_name_list,
-                            session_summary=session_summary,
-                            **static_ctx,
-                        )
-                suffix = build_dynamic_suffix(
-                    task_summary=task_summary,
-                    budget_warning=budget_warning,
-                    pending_task_count=pending_task_count,
-                    context_file=context_file,
-                )
+                        static_prefix = build_static_prompt_prefix(ctx)
+                suffix = build_dynamic_suffix(ctx)
                 system_prompt = static_prefix + ("\n\n" + suffix if suffix else "")
 
             # Emit thinking event (enhanced in deep-work mode)
@@ -281,7 +263,7 @@ class AgentRuntime:
                     "max_iterations": max_iterations,
                     "tokens_used": run_usage["total_tokens"],
                     "token_budget": token_budget,
-                    "task_summary": task_summary,
+                    "task_summary": ctx.task_summary,
                 })
             yield AgentEvent("thinking", thinking_data)
 
@@ -290,14 +272,14 @@ class AgentRuntime:
                     and compaction_count < max_compactions
                     and run_usage["total_tokens"] / token_budget >= compaction_threshold):
                 compaction_count += 1
-                task_summary = session.task_store.summary()
-                context_file = session.compact(
-                    self.agent_config.workspace, task_summary
+                ctx.task_summary = session.task_store.summary()
+                ctx.context_file = session.compact(
+                    self.agent_config.workspace, ctx.task_summary
                 )
                 logger.info(
                     f"Auto-compaction #{compaction_count}: "
                     f"{run_usage['total_tokens']:,} tokens used, "
-                    f"context saved to {context_file}"
+                    f"context saved to {ctx.context_file}"
                 )
                 # Reset token budget counter
                 run_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -305,17 +287,13 @@ class AgentRuntime:
                 yield AgentEvent("text", {
                     "text": (
                         f"[Auto-compacted conversation (#{compaction_count}/{max_compactions}). "
-                        f"Context saved to {context_file}. Continuing work...]"
+                        f"Context saved to {ctx.context_file}. Continuing work...]"
                     ),
                 })
                 # Rebuild system prompt with context_file reference
-                pending_task_count = session.task_store.pending_count()
+                ctx.pending_task_count = session.task_store.pending_count()
                 # Reset openai message cache since messages were compacted
-                suffix = build_dynamic_suffix(
-                    task_summary=task_summary,
-                    pending_task_count=pending_task_count,
-                    context_file=context_file,
-                )
+                suffix = build_dynamic_suffix(ctx)
                 system_prompt = static_prefix + ("\n\n" + suffix if suffix else "")
 
             # Token budget enforcement (hard stop — safety net after compaction cap)
@@ -337,9 +315,17 @@ class AgentRuntime:
 
             # Build messages for the API
             messages = [{"role": "system", "content": system_prompt}]
-            messages.extend(session.get_openai_messages())
+            raw_history = session.get_openai_messages()
+            compacted_history = truncate_tool_results(raw_history)
+            messages.extend(compacted_history)
 
             # Call the model via OpenRouter
+            yield AgentEvent("thinking", {
+                "iteration": iteration,
+                "phase": "llm_call",
+                "model": self.agent_config.model.model_id,
+                "prompt_tokens_estimate": _estimate_prompt_tokens(messages),
+            })
             try:
                 kwargs: dict[str, Any] = {
                     "model": self.agent_config.model.model_id,
@@ -360,6 +346,12 @@ class AgentRuntime:
 
             choice = response.choices[0]
             message = choice.message
+
+            yield AgentEvent("thinking", {
+                "iteration": iteration,
+                "phase": "llm_response",
+                "response_tokens": (response.usage.completion_tokens if response.usage else 0),
+            })
 
             # Record token usage
             if response.usage:
@@ -408,23 +400,23 @@ class AgentRuntime:
                     })
 
                 # Execute tool calls in parallel (defer task store saves during batch)
-                if is_deep_work:
-                    session.task_store._auto_save = False
-
                 async def _exec_tool(tc_name, tc_args):
                     t0 = time.monotonic()
                     res = await self.tools.execute(tc_name, tc_args, context=tool_context)
                     dur = round((time.monotonic() - t0) * 1000)
                     return res, dur
 
-                logger.info(f"Executing {len(parsed_calls)} tool(s) in parallel: {[n for _, n, _ in parsed_calls]}")
-                exec_results = await asyncio.gather(
-                    *(_exec_tool(name, args) for _, name, args in parsed_calls)
-                )
-
                 if is_deep_work:
-                    session.task_store._auto_save = True
-                    session.task_store.flush()
+                    session.task_store._auto_save = False
+                try:
+                    logger.info(f"Executing {len(parsed_calls)} tool(s) in parallel: {[n for _, n, _ in parsed_calls]}")
+                    exec_results = await asyncio.gather(
+                        *(_exec_tool(name, args) for _, name, args in parsed_calls)
+                    )
+                finally:
+                    if is_deep_work:
+                        session.task_store._auto_save = True
+                        session.task_store.flush()
 
                 # Emit results and add to session in order
                 for (tool_call, tool_name, tool_args), (result, duration_ms) in zip(parsed_calls, exec_results):

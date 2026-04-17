@@ -6,10 +6,41 @@ load_static_context reads workspace files once per run for caching.
 
 from __future__ import annotations
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
 
 logger = logging.getLogger("agent_computer.context")
+
+
+@dataclass
+class PromptContext:
+    """All inputs needed to build the agent's system prompt."""
+    # Identity & setup (set once per run)
+    workspace: str
+    agent_name: str
+    mode: str = "bounded"
+    tool_names: list[str] = field(default_factory=list)
+    soul_content: str = ""
+    user_content: str = ""
+    static_memory_fallback: str = ""
+    max_iterations: int | None = None
+    provider: str | None = None
+    relevant_memories: list[dict] | None = None
+
+    # Deep-work state
+    deep_work_phase: str | None = None
+    session_summary: str = ""
+
+    # Dynamic (changes per iteration in deep work)
+    task_summary: str = ""
+    budget_warning: str = ""
+    pending_task_count: int = 0
+    context_file: str = ""
+
+    # Accepted but currently unused
+    user_message: str = ""
+
 
 DEEP_WORK_PLANNING_INSTRUCTIONS = """
 ## Deep Work Mode — PLANNING PHASE
@@ -109,20 +140,7 @@ def load_static_context(workspace: str) -> dict:
     return result
 
 
-def build_static_prompt_prefix(
-    workspace: str,
-    agent_name: str,
-    mode: str = "bounded",
-    deep_work_phase: str | None = None,
-    relevant_memories: list[dict] | None = None,
-    tool_names: list[str] | None = None,
-    soul_content: str = "",
-    user_content: str = "",
-    static_memory_fallback: str = "",
-    session_summary: str = "",
-    max_iterations: int | None = None,
-    provider: str | None = None,
-) -> str:
+def build_static_prompt_prefix(ctx: PromptContext) -> str:
     """Assemble the static parts of the system prompt (parts 1-7).
 
     These don't change between iterations within a single deep work run.
@@ -131,9 +149,9 @@ def build_static_prompt_prefix(
 
     # 1. Base identity
     now = datetime.now(timezone.utc).strftime("%A, %B %d, %Y %H:%M UTC")
-    parts.append(f"""You are {agent_name}, a personal AI assistant powered by agent_computer.
+    parts.append(f"""You are {ctx.agent_name}, a personal AI assistant powered by agent_computer.
 Current date/time: {now}
-Workspace directory: {workspace}
+Workspace directory: {ctx.workspace}
 
 You are an autonomous agent running in an agentic loop with tool access.
 Think step-by-step. Be concise. If a tool call fails, try an alternative approach.
@@ -148,25 +166,25 @@ Batched tool calls execute in parallel for faster results. Only make sequential 
 one operation depends on another's output.""")
 
     # 1.5. Efficiency rules for bounded mode on local models
-    if mode != "deep_work" and provider == "lmstudio" and max_iterations is not None:
+    if ctx.mode != "deep_work" and ctx.provider == "lmstudio" and ctx.max_iterations is not None:
         parts.append(f"""## Efficiency Rules
-- You have a HARD LIMIT of {max_iterations} total steps. Plan accordingly.
+- You have a HARD LIMIT of {ctx.max_iterations} total steps. Plan accordingly.
 - Make MULTIPLE tool calls in a SINGLE response when possible (they run in parallel).
 - For web research: fetch 2-3 URLs in ONE response, not one at a time.
 - After gathering information, STOP fetching and give your answer. Do NOT keep searching for marginally better results.
 - If you have enough information to answer the user, ANSWER IMMEDIATELY.""")
 
     # 2. SOUL.md
-    if soul_content:
-        parts.append(f"<agent_identity_&_rules>\n{soul_content}\n</agent_identity_&_rules>")
+    if ctx.soul_content:
+        parts.append(f"<agent_identity_&_rules>\n{ctx.soul_content}\n</agent_identity_&_rules>")
 
     # 3. USER.md
-    if user_content:
-        parts.append(f"<user_context>\n{user_content}\n</user_context>")
+    if ctx.user_content:
+        parts.append(f"<user_context>\n{ctx.user_content}\n</user_context>")
 
     # 4. Tool inventory
-    if tool_names:
-        tool_list = ", ".join(tool_names)
+    if ctx.tool_names:
+        tool_list = ", ".join(ctx.tool_names)
         parts.append(
             f"<available_tools>\nYou have these tools: {tool_list}\n"
             "Use the appropriate tool for each task. If a tool call fails, try an alternative.\n"
@@ -174,7 +192,7 @@ one operation depends on another's output.""")
         )
 
     # 4.5. Parallel tool usage examples (deep work mode only)
-    if mode == "deep_work":
+    if ctx.mode == "deep_work":
         parts.append("""<parallel_tool_examples>
 GOOD - Batched (1 iteration):
 Call web_fetch("url1"), web_fetch("url2"), web_fetch("url3") in ONE response
@@ -191,9 +209,9 @@ When NOT to batch:
 </parallel_tool_examples>""")
 
     # 5. Relevant memories
-    if relevant_memories:
+    if ctx.relevant_memories:
         mem_lines = []
-        for m in relevant_memories:
+        for m in ctx.relevant_memories:
             content = m.get("content", "")
             if len(content) > 500:
                 content = content[:500] + "..."
@@ -206,16 +224,16 @@ When NOT to batch:
             + "\n".join(mem_lines)
             + "\n</relevant_memories>"
         )
-    elif static_memory_fallback:
-        parts.append(static_memory_fallback)
+    elif ctx.static_memory_fallback:
+        parts.append(ctx.static_memory_fallback)
 
     # 6. Session context
-    if session_summary:
-        parts.append(f"<session_context>\nThis session so far: {session_summary}\n</session_context>")
+    if ctx.session_summary:
+        parts.append(f"<session_context>\nThis session so far: {ctx.session_summary}\n</session_context>")
 
     # 7. Deep work instructions (phase-aware)
-    if mode == "deep_work":
-        if deep_work_phase == "executing":
+    if ctx.mode == "deep_work":
+        if ctx.deep_work_phase == "executing":
             parts.append(DEEP_WORK_EXECUTION_INSTRUCTIONS)
         else:
             parts.append(DEEP_WORK_PLANNING_INSTRUCTIONS)
@@ -223,12 +241,7 @@ When NOT to batch:
     return "\n\n".join(parts)
 
 
-def build_dynamic_suffix(
-    task_summary: str = "",
-    budget_warning: str = "",
-    pending_task_count: int = 0,
-    context_file: str = "",
-) -> str:
+def build_dynamic_suffix(ctx: PromptContext) -> str:
     """Assemble the dynamic parts of the system prompt (parts 8-10).
 
     These change per iteration in deep work mode.
@@ -236,25 +249,25 @@ def build_dynamic_suffix(
     parts: list[str] = []
 
     # 8. Task state
-    if task_summary:
+    if ctx.task_summary:
         resume_hint = ""
-        if pending_task_count > 0:
+        if ctx.pending_task_count > 0:
             resume_hint = (
-                f"\n\nYou have {pending_task_count} task(s) still to do. "
+                f"\n\nYou have {ctx.pending_task_count} task(s) still to do. "
                 "Pick up the next pending task immediately — call a tool, do NOT produce a text-only response."
             )
-        parts.append(f"<current_tasks>\n{task_summary}{resume_hint}\n</current_tasks>")
+        parts.append(f"<current_tasks>\n{ctx.task_summary}{resume_hint}\n</current_tasks>")
 
     # 9. Budget warning
-    if budget_warning:
-        parts.append(f"<budget_warning>\n{budget_warning}\n</budget_warning>")
+    if ctx.budget_warning:
+        parts.append(f"<budget_warning>\n{ctx.budget_warning}\n</budget_warning>")
 
     # 10. Archived context
-    if context_file:
+    if ctx.context_file:
         parts.append(
             f"<archived_context>\n"
             f"Your conversation was auto-compacted to save tokens. "
-            f"Full prior context is saved at:\n{context_file}\n"
+            f"Full prior context is saved at:\n{ctx.context_file}\n"
             f"Use `read_file` to review earlier work if needed. "
             f"Your task list is the source of truth for progress.\n"
             f"</archived_context>"
@@ -263,52 +276,11 @@ def build_dynamic_suffix(
     return "\n\n".join(parts)
 
 
-def build_system_prompt(
-    workspace: str,
-    agent_name: str,
-    mode: str = "bounded",
-    task_summary: str = "",
-    budget_warning: str = "",
-    pending_task_count: int = 0,
-    context_file: str = "",
-    relevant_memories: list[dict] | None = None,
-    user_message: str = "",
-    tool_names: list[str] | None = None,
-    session_summary: str = "",
-    soul_content: str = "",
-    user_content: str = "",
-    static_memory_fallback: str = "",
-    max_iterations: int | None = None,
-    provider: str | None = None,
-) -> str:
-    """Assemble the full system prompt. Pure function — no file I/O.
-
-    Backward-compatible wrapper that calls build_static_prompt_prefix + build_dynamic_suffix.
-    """
-    prefix = build_static_prompt_prefix(
-        workspace=workspace,
-        agent_name=agent_name,
-        mode=mode,
-        relevant_memories=relevant_memories,
-        tool_names=tool_names,
-        soul_content=soul_content,
-        user_content=user_content,
-        static_memory_fallback=static_memory_fallback,
-        session_summary=session_summary,
-        max_iterations=max_iterations,
-        provider=provider,
-    )
-
-    suffix = build_dynamic_suffix(
-        task_summary=task_summary,
-        budget_warning=budget_warning,
-        pending_task_count=pending_task_count,
-        context_file=context_file,
-    )
-
-    if suffix:
-        return prefix + "\n\n" + suffix
-    return prefix
+def build_system_prompt(ctx: PromptContext) -> str:
+    """Assemble the full system prompt. Pure function — no file I/O."""
+    prefix = build_static_prompt_prefix(ctx)
+    suffix = build_dynamic_suffix(ctx)
+    return prefix + ("\n\n" + suffix if suffix else "")
 
 
 def estimate_tokens(text: str) -> int:
