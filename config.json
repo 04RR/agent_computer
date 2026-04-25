@@ -28,7 +28,8 @@
       ],
       "require_approval": [
         "shell"
-      ]
+      ],
+      "non_interactive_approval_policy": "deny"
     },
     "max_loop_iterations": 20,
     "deep_work": {

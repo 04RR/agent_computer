@@ -230,6 +230,10 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
     async def manage_tasks(action: str, task_id: int | None = None, title: str | None = None,
                            description: str | None = None, status: str | None = None,
                            parent_id: int | None = None, result: str | None = None,
+                           node_type: str | None = None, depends_on: list[int] | None = None,
+                           config: dict | None = None, inputs: dict | None = None,
+                           output_schema: dict | None = None,
+                           from_task: int | None = None, to_task: int | None = None,
                            _context: dict | None = None) -> str:
         ctx = _context or {}
         mode = ctx.get("mode", "bounded")
@@ -241,10 +245,37 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
         if store is None:
             return json.dumps({"error": "No task store available"})
 
+        valid_node_types = ("agent", "tool", "gather")
+
         if action == "create":
             if not title:
                 return json.dumps({"error": "title is required for create"})
-            task = store.create(title=title, description=description or "", parent_id=parent_id)
+            nt = node_type or "agent"
+            if nt not in valid_node_types:
+                return json.dumps({
+                    "error": f"Invalid node_type '{nt}'. Must be one of: {', '.join(valid_node_types)}.",
+                })
+            deps = depends_on or []
+            missing = [d for d in deps if store.get(d) is None]
+            if missing:
+                return json.dumps({
+                    "error": f"depends_on references nonexistent task(s): {missing}",
+                })
+            cfg = config or {}
+            if nt == "tool" and not cfg.get("tool_name"):
+                return json.dumps({
+                    "error": "Tool nodes must include config.tool_name",
+                })
+            task = store.create(
+                title=title,
+                description=description or "",
+                parent_id=parent_id,
+                node_type=nt,
+                depends_on=deps,
+                config=cfg,
+                inputs=inputs or {},
+                output_schema=output_schema or {},
+            )
             return json.dumps({"status": "created", "task": task.to_dict()})
 
         elif action == "list":
@@ -261,10 +292,82 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
                 kwargs["description"] = description
             if status is not None:
                 kwargs["status"] = status
+            if node_type is not None:
+                if node_type not in valid_node_types:
+                    return json.dumps({
+                        "error": f"Invalid node_type '{node_type}'. Must be one of: {', '.join(valid_node_types)}.",
+                    })
+                kwargs["node_type"] = node_type
+            if depends_on is not None:
+                missing = [d for d in depends_on if store.get(d) is None]
+                if missing:
+                    return json.dumps({
+                        "error": f"depends_on references nonexistent task(s): {missing}",
+                    })
+                kwargs["depends_on"] = depends_on
+            if config is not None:
+                kwargs["config"] = config
+            if inputs is not None:
+                kwargs["inputs"] = inputs
+            if output_schema is not None:
+                kwargs["output_schema"] = output_schema
             task = store.update(task_id, **kwargs)
             if not task:
                 return json.dumps({"error": f"Task {task_id} not found"})
             return json.dumps({"status": "updated", "task": task.to_dict()})
+
+        elif action == "connect":
+            if from_task is None or to_task is None:
+                return json.dumps({"error": "connect requires from_task and to_task"})
+            res = store.add_dependency(from_task, to_task)
+            if res["ok"]:
+                if res.get("noop"):
+                    return json.dumps({
+                        "status": "ok",
+                        "noop": True,
+                        "message": f"Edge {from_task} -> {to_task} already exists",
+                    })
+                return json.dumps({
+                    "status": "connected",
+                    "from_task": from_task,
+                    "to_task": to_task,
+                })
+            reason = res.get("reason", "unknown")
+            if reason == "missing_task":
+                return json.dumps({
+                    "error": f"Cannot connect: task {res.get('task_id')} does not exist",
+                    "reason": reason,
+                })
+            if reason == "self_loop":
+                return json.dumps({
+                    "error": f"Cannot connect task {res.get('task_id')} to itself",
+                    "reason": reason,
+                })
+            if reason == "cycle":
+                return json.dumps({
+                    "error": (
+                        f"Adding edge {from_task} -> {to_task} would create a cycle through "
+                        f"tasks {res.get('would_form')}. Restructure the plan — either "
+                        f"remove a different edge or reorder the tasks."
+                    ),
+                    "reason": reason,
+                    "would_form": res.get("would_form"),
+                })
+            return json.dumps({"error": "Connect failed", "reason": reason})
+
+        elif action == "disconnect":
+            if from_task is None or to_task is None:
+                return json.dumps({"error": "disconnect requires from_task and to_task"})
+            res = store.remove_dependency(from_task, to_task)
+            if res["ok"]:
+                return json.dumps({"status": "disconnected", "from_task": from_task, "to_task": to_task})
+            return json.dumps({
+                "error": f"No edge {from_task} -> {to_task} exists",
+                "reason": res.get("reason", "unknown"),
+            })
+
+        elif action == "validate":
+            return json.dumps(store.validate_dag())
 
         elif action == "complete":
             if task_id is None:
@@ -290,19 +393,42 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
             return json.dumps({"error": f"Task {task_id} not found"})
 
         else:
-            return json.dumps({"error": f"Unknown action: {action}. Use: create, list, update, complete, delete"})
+            return json.dumps({
+                "error": (
+                    f"Unknown action: {action}. Use: create, list, update, complete, "
+                    f"delete, connect, disconnect, validate"
+                ),
+            })
 
     registry.register(Tool(
         name="manage_tasks",
-        description="Manage tasks for tracking progress in deep work mode. Actions: create, list, update, complete, delete.",
+        description=(
+            "Manage tasks for tracking progress in deep work mode. Actions: create, list, "
+            "update, complete, delete.\n\n"
+            "Authoring DAGs (directed acyclic graphs): tasks have a node_type "
+            "('agent' default, 'tool', or 'gather') and a depends_on list of upstream task IDs. "
+            "Use action='connect' / 'disconnect' to add or remove dependency edges, and "
+            "action='validate' to check the plan for cycles, missing dependencies, "
+            "unresolvable templates, and disconnected components. Tool nodes require "
+            "config.tool_name. Inputs and tool config can reference upstream outputs as "
+            "{{task_N.output.field}} or {{task_N.result}} — these references require a "
+            "(direct or transitive) dependency edge. Always validate before finalizing a plan."
+        ),
         params=[
-            ToolParam("action", "string", "Action to perform: create, list, update, complete, delete"),
+            ToolParam("action", "string", "Action: create, list, update, complete, delete, connect, disconnect, validate"),
             ToolParam("task_id", "integer", "Task ID (required for update/complete/delete)", required=False),
             ToolParam("title", "string", "Task title (required for create)", required=False),
             ToolParam("description", "string", "Task description", required=False),
             ToolParam("status", "string", "Task status: pending, in_progress, completed, blocked", required=False),
-            ToolParam("parent_id", "integer", "Parent task ID for subtasks", required=False),
+            ToolParam("parent_id", "integer", "Parent task ID for hierarchical grouping (separate from DAG depends_on)", required=False),
             ToolParam("result", "string", "Result summary (for complete action)", required=False),
+            ToolParam("node_type", "string", "Node type for create/update: agent (default), tool, or gather", required=False),
+            ToolParam("depends_on", "array", "List of task IDs this task depends on (DAG edges)", required=False),
+            ToolParam("config", "object", "Per-node config dict; tool nodes must include tool_name and tool_args", required=False),
+            ToolParam("inputs", "object", "Templated inputs dict; may reference upstream outputs as {{task_N.output.field}}", required=False),
+            ToolParam("output_schema", "object", "JSON schema describing expected output shape (agent nodes)", required=False),
+            ToolParam("from_task", "integer", "Source task ID for connect/disconnect", required=False),
+            ToolParam("to_task", "integer", "Target task ID for connect/disconnect (this task will depend on from_task)", required=False),
         ],
         handler=manage_tasks,
     ))

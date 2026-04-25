@@ -72,6 +72,168 @@ user has asked for a plan-first workflow. Do not skip ahead.
 The Completeness rules in your identity apply to the PLAN you produce — ensure your plan
 addresses all parts of the user's request, but do NOT execute any parts during planning.
 
+### DAG Planning
+
+You are authoring a directed acyclic graph (DAG) of tasks, not a linear
+list.
+
+Every task is a node. Nodes with no dependencies run in parallel. Nodes
+with `depends_on` wait for their upstream nodes to complete before
+starting.
+
+You have three node types:
+
+1. **agent** — Runs a full agentic loop with tool access. Use when
+   reasoning, decomposition, or multi-step work is needed. This is the
+   default.
+
+2. **tool** — Single deterministic tool call, no LLM. Use when the exact
+   operation is known up front (fetch this URL, read this file, run
+   this shell command). Faster and cheaper than an agent node. Config
+   must include `tool_name` and `tool_args`.
+
+3. **gather** — Explicit synchronization point with no computation.
+   Collects outputs from all upstream nodes into a dict keyed by task
+   ID. Use when multiple parallel branches converge.
+
+### Authoring pattern
+
+For most research-and-synthesize requests, the pattern is:
+
+    [source_1] ─┐
+    [source_2] ─┼─→ [gather] ─→ [synthesize_agent]
+    [source_3] ─┘
+
+Each `source_N` is either a tool node (if the URL/query is known) or
+an agent node (if research is needed to find the source). The `gather`
+node collects their outputs. The `synthesize_agent` produces the final
+answer, referencing `{{gather_task_id.output}}` in its inputs.
+
+### When to use parallel vs sequential
+
+Default to parallel unless there's a real dependency. If task B uses
+output from task A, B depends on A. Otherwise they should run in
+parallel.
+
+Example: "Research X and Y and compare" — X and Y are parallel, the
+comparison depends on both (via a gather node).
+
+Example: "Download a file and then analyze it" — sequential, the
+analysis depends on the download.
+
+### parent_id vs depends_on
+
+The Task model has two separate fields: `parent_id` and
+`depends_on`. They are NOT the same thing.
+
+- `parent_id` is for visual grouping in the canvas UI (a future
+  feature). It has NO execution semantics. Tasks with the same
+  `parent_id` are visually grouped; that's it.
+
+- `depends_on` is for execution ordering. A task with `depends_on:
+  [N]` waits for task N to complete before starting, and can
+  reference task N's output via templates.
+
+Do NOT create empty "parent" agent tasks that other tasks depend on
+as a grouping mechanism. If you find yourself creating a top-level
+task with no real work whose only purpose is to "oversee" the
+others, delete it. The DAG itself expresses the structure.
+
+If you want N parallel branches to converge into a single output,
+use a `gather` node — not a parent agent task that the branches
+depend on.
+
+### Templated inputs
+
+Node inputs can reference upstream outputs with
+`{{task_N.output.field}}` or `{{task_N.result}}`.
+
+Always use the full `task_N` prefix. Shortened forms like
+`{{N.output}}` or `{{4.output}}` are NOT valid and will fail
+validation.
+
+Where to put templates depends on the node type:
+
+- **Agent nodes**: put templated values in the top-level `inputs`
+  field of the task, not nested inside `config`. The `config`
+  field is for per-node settings; `inputs` is for wiring data
+  from upstream nodes.
+
+  Correct:
+
+      manage_tasks(
+          action="create",
+          title="Synthesize the answer",
+          node_type="agent",
+          depends_on=[4],
+          inputs={"upstream_data": "{{task_4.output}}"},
+          output_schema={...},
+      )
+
+  Incorrect (template buried inside config):
+
+      manage_tasks(
+          action="create",
+          ...
+          config={"inputs": {"upstream_data": "{{task_4.output}}"}},
+          inputs={},
+      )
+
+- **Tool nodes**: templates go in `config.tool_args` because that's
+  where the tool's runtime arguments live. Example:
+
+      manage_tasks(
+          action="create",
+          title="Fetch a URL discovered upstream",
+          node_type="tool",
+          depends_on=[3],
+          config={
+              "tool_name": "web_fetch",
+              "tool_args": {"url": "{{task_3.output.url}}"},
+          },
+      )
+
+- **Gather nodes**: take no templates. They automatically collect
+  upstream outputs into a dict keyed by task ID. Downstream nodes
+  reference the gather as `{{task_N.output}}` and receive the full
+  dict.
+
+Template references require a dependency edge — you cannot
+template task N's output into task M unless M depends on N
+(directly or transitively).
+
+### Output schemas
+
+For agent nodes that should produce structured output, set
+`output_schema` to a JSON schema describing the required shape. The
+agent will be prompted to produce matching JSON.
+
+### Workflow
+
+1. Decompose the user's request into nodes.
+2. Create each node with `manage_tasks(action="create", ...)`, including
+   node_type, depends_on, config, and inputs.
+3. Call `manage_tasks(action="validate")` to check for cycles, orphans,
+   and unresolvable templates.
+4. Fix any validation errors by creating missing nodes, adding edges
+   via `connect`, or updating config.
+5. Once valid, write your final summary describing the plan.
+
+### Rules
+
+- Every plan must have at least one source node (no dependencies) and
+  at least one sink node (no nodes depend on it).
+- Use `gather` nodes when 2+ parallel branches converge. Don't create
+  implicit N-way joins by having one agent node depend on many upstream
+  nodes — that works, but a gather node makes the synchronization
+  visible and matches the expected pattern.
+- Linear plans are valid. If the request really is sequential, a chain
+  of nodes each depending on the previous one is correct.
+- Default to agent nodes unless you're certain a tool node is
+  sufficient. Agent nodes handle ambiguity; tool nodes don't.
+- Always call `validate` before writing your final summary. If
+  validation fails, fix the errors and re-validate.
+
 ### Phase transition
 The phase will transition from PLANNING to AWAITING_APPROVAL once you produce a text response
 without further tool calls. After the user approves, you will enter the EXECUTION phase with

@@ -15,7 +15,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from openai import AsyncOpenAI
 
@@ -77,6 +77,27 @@ class AgentEvent:
     data: dict[str, Any]
 
 
+# Callback signature used by approval flows. Caller receives the tool_call_id
+# so it can correlate the decision with an earlier tool_call / approval_request
+# event. Returns True to allow the call, False to deny.
+ApprovalCallback = Callable[[str, str, dict], Awaitable[bool]]
+
+
+def build_policy_callback(policy: str, label: str) -> ApprovalCallback:
+    """Build an approval callback for non-interactive contexts (HTTP, cron).
+
+    ``policy`` is "deny" or "auto_approve". ``label`` appears in logs so the
+    audit trail identifies which caller made the decision.
+    """
+    async def cb(tool_call_id: str, tool_name: str, tool_args: dict) -> bool:
+        if policy == "auto_approve":
+            logger.info(f"{label}: auto-approved {tool_name} (call {tool_call_id})")
+            return True
+        logger.warning(f"{label}: denied {tool_name} (call {tool_call_id}, policy={policy})")
+        return False
+    return cb
+
+
 def _estimate_prompt_tokens(messages: list[dict]) -> int:
     """Cheap token estimate for UI display. ~4 chars per token."""
     return sum(len(str(m.get("content", ""))) for m in messages) // 4
@@ -130,10 +151,21 @@ class AgentRuntime:
         )
         logger.info(f"Model switched: {model_id} via {provider} ({base_url})")
 
-    async def run(self, session: Session, user_message: str, mode: str | None = None) -> AsyncIterator[AgentEvent]:
+    async def run(
+        self,
+        session: Session,
+        user_message: str,
+        mode: str | None = None,
+        approval_callback: ApprovalCallback | None = None,
+    ) -> AsyncIterator[AgentEvent]:
         """Run the full agentic loop for a user message.
 
         Yields AgentEvent objects for real-time streaming to the client.
+
+        ``approval_callback`` is consulted before executing any tool whose
+        ``require_approval`` flag is set. If it is None and such a tool is
+        requested, the call is denied by default and the model sees an error
+        result (same shape as any other tool error).
         """
         # Resolve mode: explicit param > session mode > default
         effective_mode = mode or session.mode
@@ -233,9 +265,11 @@ class AgentRuntime:
         # 8. Run the agentic loop
         iteration = 0
         consecutive_text_only = 0  # Safety valve: exit after 2 consecutive text-only responses
-        # Circuit breaker for repetitive tool calls (lmstudio only)
-        consecutive_same_tool = 0
-        last_tool_name: str | None = None
+        # Circuit breaker for repetitive tool calls (lmstudio only).
+        # Compares full batch signatures (name + args) iteration-to-iteration so that
+        # legitimate sequential research with differing args doesn't trip it.
+        consecutive_identical_batches = 0
+        last_batch_signature: tuple | None = None
         run_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         compaction_count = 0
         max_compactions = 5  # Safety cap — effectively 6x budget total
@@ -414,8 +448,36 @@ class AgentRuntime:
                         "timestamp": time.time(),
                     })
 
-                # Execute tool calls in parallel (defer task store saves during batch)
-                async def _exec_tool(tc_name, tc_args):
+                # Execute tool calls in parallel (defer task store saves during batch).
+                # Approval is checked live via self.tools.get(...) inside the closure so
+                # runtime changes to require_approval take effect immediately without
+                # any cached snapshot. If approval_callback is None and a tool requires
+                # approval, the call is denied with an error result.
+                async def _exec_tool(tc, tc_name, tc_args):
+                    tool = self.tools.get(tc_name)
+                    if tool is not None and tool.require_approval:
+                        if approval_callback is None:
+                            logger.warning(
+                                f"Tool {tc_name} requires approval but no approval_callback "
+                                f"was provided — denying by default"
+                            )
+                            return (
+                                json.dumps({
+                                    "error": "Tool requires approval but no approver available",
+                                    "tool": tc_name,
+                                }),
+                                0,
+                            )
+                        try:
+                            approved = await approval_callback(tc.id, tc_name, tc_args)
+                        except Exception as e:
+                            logger.warning(f"Approval callback raised for {tc_name}: {e}")
+                            approved = False
+                        if not approved:
+                            return (
+                                json.dumps({"error": "Tool call denied", "tool": tc_name}),
+                                0,
+                            )
                     t0 = time.monotonic()
                     res = await self.tools.execute(tc_name, tc_args, context=tool_context)
                     dur = round((time.monotonic() - t0) * 1000)
@@ -426,7 +488,7 @@ class AgentRuntime:
                 try:
                     logger.info(f"Executing {len(parsed_calls)} tool(s) in parallel: {[n for _, n, _ in parsed_calls]}")
                     exec_results = await asyncio.gather(
-                        *(_exec_tool(name, args) for _, name, args in parsed_calls)
+                        *(_exec_tool(tc, name, args) for tc, name, args in parsed_calls)
                     )
                 finally:
                     if is_deep_work:
@@ -469,20 +531,28 @@ class AgentRuntime:
                 # Flush buffered writes before next iteration
                 session.flush()
 
-                # Circuit breaker: detect repetitive same-tool calls (lmstudio only)
+                # Circuit breaker: detect repetitive identical tool-call batches (lmstudio only).
+                # Signature is a sorted tuple of (name, canonical_args_json) so order within a
+                # batch doesn't matter but argument values do.
                 if self.agent_config.model.provider == "lmstudio":
-                    tool_names_this_iter = set(name for _, name, _ in parsed_calls)
-                    if len(tool_names_this_iter) == 1 and tool_names_this_iter.pop() == last_tool_name:
-                        consecutive_same_tool += 1
+                    batch_signature = tuple(sorted(
+                        (name, json.dumps(args, sort_keys=True))
+                        for _, name, args in parsed_calls
+                    ))
+                    if batch_signature == last_batch_signature:
+                        consecutive_identical_batches += 1
                     else:
-                        consecutive_same_tool = 1
-                    last_tool_name = next(iter(set(name for _, name, _ in parsed_calls)))
-                    if consecutive_same_tool >= 3:
+                        consecutive_identical_batches = 1
+                    last_batch_signature = batch_signature
+                    if consecutive_identical_batches >= 3:
                         session.add_message("user",
-                            "[SYSTEM: You have called the same tool multiple times consecutively. "
-                            "Synthesize the information you already have and respond to the user.]"
+                            "[AUTOMATED FRAMEWORK NUDGE — not from the user] You have made the "
+                            "same tool call(s) with identical arguments 3 times in a row. This "
+                            "usually means you're stuck. Either try a different approach or "
+                            "synthesize what you have and respond."
                         )
-                        consecutive_same_tool = 0
+                        consecutive_identical_batches = 0
+                        last_batch_signature = None
 
                 # Loop continues — model will see tool results and decide next step
                 consecutive_text_only = 0  # Reset: model is actively using tools
@@ -498,8 +568,8 @@ class AgentRuntime:
                 if not is_planning:
                     yield AgentEvent("text", {"text": final_text})
                 # Reset circuit breaker on text response
-                consecutive_same_tool = 0
-                last_tool_name = None
+                consecutive_identical_batches = 0
+                last_batch_signature = None
 
             # Deep work execution phase: don't exit if there are still pending tasks
             if is_deep_work and not is_planning:
@@ -566,10 +636,16 @@ class AgentRuntime:
                 "message": f"Agent loop hit max iterations ({max_iterations}). Stopping.",
             })
 
-    async def run_simple(self, session: Session, user_message: str, mode: str | None = None) -> str:
+    async def run_simple(
+        self,
+        session: Session,
+        user_message: str,
+        mode: str | None = None,
+        approval_callback: ApprovalCallback | None = None,
+    ) -> str:
         """Run the agent loop and return the final text response (non-streaming)."""
         final_text = ""
-        async for event in self.run(session, user_message, mode=mode):
+        async for event in self.run(session, user_message, mode=mode, approval_callback=approval_callback):
             if event.type == "done":
                 final_text = event.data.get("text", "")
             elif event.type == "error":

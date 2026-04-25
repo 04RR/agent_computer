@@ -250,6 +250,72 @@
   }
   .tool-event.expanded pre { display: block; }
 
+  /* Tool approval cards */
+  .approval-card {
+    align-self: flex-start;
+    max-width: 85%;
+    padding: 12px 14px;
+    border-radius: 8px;
+    background: var(--surface);
+    border-left: 3px solid var(--accent);
+    font-size: 13px;
+    font-family: var(--sans);
+  }
+  .approval-card .title {
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 4px;
+    font-size: 13px;
+  }
+  .approval-card .tool-id {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+  .approval-card pre {
+    background: var(--bg);
+    padding: 8px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 11px;
+    max-height: 160px;
+    overflow: auto;
+    margin-bottom: 8px;
+    color: var(--text);
+  }
+  .approval-card .actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .approval-card button {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: var(--sans);
+  }
+  .approval-card button:disabled { opacity: 0.55; cursor: default; }
+  .approval-card .allow { background: var(--green); color: #0b1522; }
+  .approval-card .deny  { background: var(--accent); color: #fff; }
+  .approval-card .allow-all {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+  }
+  .approval-card .resolution {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    font-style: italic;
+  }
+  .approval-card.resolved-allow { border-left-color: var(--green); }
+  .approval-card.resolved-deny  { border-left-color: var(--accent); }
+  .approval-card.resolved-timeout { border-left-color: var(--yellow); }
+
   /* Activity panel — grouped per-iteration log */
   .activity-panel {
     align-self: flex-start;
@@ -899,12 +965,15 @@
   }
 
   /* ── Plan Approval Card ── */
+  /* The card expands naturally inside the chat scroll container; .plan-actions
+     uses position:sticky to stay reachable when the plan is taller than the
+     viewport. overflow:hidden is intentionally NOT set, since it would clip
+     sticky descendants inside the containing block. */
   .plan-card {
     background: var(--surface);
     border: 1px solid var(--accent);
     border-radius: 12px;
     margin: 8px 0;
-    overflow: hidden;
   }
   .plan-card-header {
     padding: 12px 16px;
@@ -925,8 +994,6 @@
   .plan-card-body .plan-text {
     font-size: 14px;
     line-height: 1.6;
-    max-height: 400px;
-    overflow-y: auto;
     margin-bottom: 16px;
   }
   .plan-card-body .plan-text p { margin: 0 0 0.6em 0; }
@@ -983,6 +1050,15 @@
     display: flex;
     gap: 10px;
     align-items: stretch;
+    /* Sticks to bottom of #chat (the scroll container) while the card is
+       partially visible, so Approve is always one click away on long plans.
+       Solid background prevents plan text from showing through. */
+    position: sticky;
+    bottom: 0;
+    background: var(--surface);
+    padding: 12px 0 4px;
+    margin-top: -8px;
+    z-index: 1;
   }
   .plan-actions .plan-btn {
     padding: 10px 24px;
@@ -1214,6 +1290,10 @@ let currentAssistantRawText = '';
 let currentMode = 'bounded';
 let taskPanelCollapsed = false;
 let deepWorkPhase = null; // null, 'planning', 'awaiting_approval', 'executing'
+// Approval cards currently awaiting a response, keyed by tool_call_id.
+const approvalCards = new Map();
+// Per-tool "allow all for this session" flags. Resets on page reload by design.
+const allowAllThisSession = new Set();
 
 // ─── Markdown rendering ───
 marked.setOptions({
@@ -1337,6 +1417,28 @@ function handleEvent(data) {
       break;
     }
 
+    case 'approval_request': {
+      // If the user has previously clicked "Allow all for this session" for
+      // this specific tool, short-circuit and auto-approve without rendering
+      // a card. Scope is per-tool by name so newly-added require_approval
+      // tools don't inherit a blanket allow.
+      if (allowAllThisSession.has(data.tool)) {
+        ws.send(JSON.stringify({
+          type: 'approval_response',
+          tool_call_id: data.tool_call_id,
+          approved: true,
+        }));
+        break;
+      }
+      finalizeCurrentPanel();
+      renderApprovalCard(data);
+      break;
+    }
+
+    case 'approval_resolved':
+      resolveApprovalCard(data);
+      break;
+
     case 'task_update':
       renderTasks(data.tasks || []);
       updateExecProgress(data.tasks || []);
@@ -1453,6 +1555,89 @@ function addSystem(text) {
   div.textContent = text;
   chatEl.appendChild(div);
   scrollToBottom();
+}
+
+function renderApprovalCard(data) {
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.dataset.toolCallId = data.tool_call_id;
+
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = `Tool approval required: ${data.tool}`;
+  card.appendChild(title);
+
+  const id = document.createElement('div');
+  id.className = 'tool-id';
+  id.textContent = `call ${data.tool_call_id}`;
+  card.appendChild(id);
+
+  const pre = document.createElement('pre');
+  try {
+    pre.textContent = JSON.stringify(data.input || {}, null, 2);
+  } catch (_) {
+    pre.textContent = String(data.input);
+  }
+  card.appendChild(pre);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+
+  const sendResponse = (approved) => {
+    ws.send(JSON.stringify({
+      type: 'approval_response',
+      tool_call_id: data.tool_call_id,
+      approved: approved,
+    }));
+    card.querySelectorAll('button').forEach(b => b.disabled = true);
+  };
+
+  const allowBtn = document.createElement('button');
+  allowBtn.className = 'allow';
+  allowBtn.textContent = 'Allow';
+  allowBtn.onclick = () => sendResponse(true);
+  actions.appendChild(allowBtn);
+
+  const denyBtn = document.createElement('button');
+  denyBtn.className = 'deny';
+  denyBtn.textContent = 'Deny';
+  denyBtn.onclick = () => sendResponse(false);
+  actions.appendChild(denyBtn);
+
+  const allowAllBtn = document.createElement('button');
+  allowAllBtn.className = 'allow-all';
+  allowAllBtn.textContent = `Allow all ${data.tool} this session`;
+  allowAllBtn.onclick = () => {
+    allowAllThisSession.add(data.tool);
+    sendResponse(true);
+  };
+  actions.appendChild(allowAllBtn);
+
+  card.appendChild(actions);
+  chatEl.appendChild(card);
+  approvalCards.set(data.tool_call_id, card);
+  scrollToBottom();
+}
+
+function resolveApprovalCard(data) {
+  const card = approvalCards.get(data.tool_call_id);
+  if (!card) return;
+  card.querySelectorAll('button').forEach(b => b.disabled = true);
+  const reasonClass = data.reason === 'allow' ? 'resolved-allow'
+                    : data.reason === 'timeout' ? 'resolved-timeout'
+                    : 'resolved-deny';
+  card.classList.add(reasonClass);
+  const note = document.createElement('div');
+  note.className = 'resolution';
+  const label = {
+    allow: 'Allowed',
+    deny: 'Denied',
+    timeout: 'Timed out (5 min) — treated as denied',
+    no_approver: 'No approver available — denied',
+  }[data.reason] || data.reason;
+  note.textContent = label;
+  card.appendChild(note);
+  approvalCards.delete(data.tool_call_id);
 }
 
 function addToolEvent(kind, toolName, detail, duration) {
@@ -2301,12 +2486,18 @@ function showPlanCard(planText, tasks) {
 function approvePlan() {
   if (!ws || ws.readyState !== 1) return;
   const btn = document.getElementById('planApproveBtn');
-  if (btn) btn.disabled = true;
-
-  // Remove plan card
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Approved';
+  }
+  // Disable feedback controls so the card visibly settles into a "decided" state
+  // while execution events stream in below it.
   const card = document.getElementById('planCard');
   if (card) {
-    card.querySelector('.plan-actions').innerHTML = '<div style="color:var(--green); font-size:13px; font-weight:600; padding:8px 0;">Plan approved — executing...</div>';
+    const fb = card.querySelector('#planFeedback');
+    if (fb) fb.disabled = true;
+    const suggestBtn = card.querySelector('.plan-btn.suggest');
+    if (suggestBtn) suggestBtn.disabled = true;
   }
 
   deepWorkPhase = 'executing';

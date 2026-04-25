@@ -28,6 +28,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from agent import build_policy_callback
+
 if TYPE_CHECKING:
     from agent import AgentRuntime
     from session import SessionManager
@@ -49,6 +51,9 @@ class CronJob:
     last_run: float | None = None
     next_run: float | None = None
     run_count: int = 0
+    # Per-job override of the scheduler's default approval policy. None means
+    # "inherit the default". Valid values mirror ToolsConfig.non_interactive_approval_policy.
+    approval_policy: str | None = None
 
 
 class CronScheduler:
@@ -64,10 +69,12 @@ class CronScheduler:
         workspace: str,
         agent: AgentRuntime,
         session_mgr: SessionManager,
+        default_approval_policy: str = "deny",
     ):
         self.workspace = workspace
         self.agent = agent
         self.session_mgr = session_mgr
+        self.default_approval_policy = default_approval_policy
         self.jobs: dict[str, CronJob] = {}
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
@@ -98,6 +105,7 @@ class CronScheduler:
                 prompt=entry.get("prompt", ""),
                 session_id=entry.get("session_id", f"cron-{job_id}"),
                 enabled=entry.get("enabled", True),
+                approval_policy=entry.get("approval_policy"),
             )
             if job.prompt and job.enabled:
                 job.next_run = _compute_next_run(job.schedule)
@@ -165,9 +173,14 @@ class CronScheduler:
 
         session = self.session_mgr.get_or_create(session_id)
 
+        policy = job.approval_policy or self.default_approval_policy
+        approval_cb = build_policy_callback(policy, f"cron:{job.id}")
+
         try:
             async with session.lock:
-                response = await self.agent.run_simple(session, job.prompt)
+                response = await self.agent.run_simple(
+                    session, job.prompt, approval_callback=approval_cb
+                )
 
             job.last_run = time.time()
             job.run_count += 1

@@ -3,6 +3,7 @@
 import json
 import logging
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -29,6 +30,9 @@ class ToolsConfig(BaseModel):
         "browser_screenshot", "browser_tabs",
     ])
     require_approval: list[str] = Field(default_factory=lambda: ["shell"])
+    # Policy for approval-requiring tools when there is no human in the loop
+    # (HTTP /api/chat, cron jobs). "deny" is the safe default.
+    non_interactive_approval_policy: Literal["deny", "auto_approve"] = "deny"
     shell_blocked_commands: list[str] = Field(default_factory=lambda: [
         "rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:", "> /dev/sda",
         "chmod -R 777 /", "curl | sh", "wget | sh",

@@ -26,7 +26,7 @@ import httpx
 import uvicorn
 
 from config import load_config
-from agent import AgentRuntime, subscribe_activity, unsubscribe_activity, get_recent_activity
+from agent import AgentRuntime, build_policy_callback, subscribe_activity, unsubscribe_activity, get_recent_activity
 from session import Session, SessionManager
 from tool_registry import ToolRegistry
 from tools import register_builtin_tools, register_task_tool, register_memory_search_tool
@@ -99,8 +99,14 @@ session_mgr = SessionManager(config.sessions.directory)
 # Agent runtime
 agent = AgentRuntime(config, tool_registry, memory_search=memory_search)
 
-# Cron scheduler
-scheduler = CronScheduler(config.agent.workspace, agent, session_mgr)
+# Cron scheduler — cron jobs are headless, so they inherit the non-interactive
+# approval policy. Individual jobs can still override via cron.json.
+scheduler = CronScheduler(
+    config.agent.workspace,
+    agent,
+    session_mgr,
+    default_approval_policy=config.agent.tools.non_interactive_approval_policy,
+)
 scheduler.load_jobs()
 
 # Signals that the server has finished initializing
@@ -225,6 +231,60 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     session = session_mgr.get_or_create(session_id)
     logger.info(f"WebSocket connected: session={session_id}")
 
+    # Approval plumbing: map tool_call_id → pending Future. The agent loop is
+    # awaiting inside asyncio.gather; we park each request here and resolve when
+    # the client sends an approval_response message.
+    pending_approvals: dict[str, asyncio.Future[bool]] = {}
+
+    async def _safe_send(payload: dict) -> bool:
+        """Send a JSON payload, swallowing disconnects. Returns True on success."""
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception as e:
+            logger.warning(f"WS send failed for session={session_id}: {e}")
+            return False
+
+    async def ws_approval_callback(tool_call_id: str, tool_name: str, tool_args: dict) -> bool:
+        """Emit an approval_request, await the client's response, emit resolution.
+
+        Returns True only on explicit user approval. Timeouts, disconnects, and
+        denies all return False so the agent treats them uniformly as refusals.
+        """
+        sent = await _safe_send({
+            "type": "approval_request",
+            "tool_call_id": tool_call_id,
+            "tool": tool_name,
+            "input": tool_args,
+        })
+        if not sent:
+            # Connection is gone; no point waiting for a response that can't arrive.
+            return False
+
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[bool] = loop.create_future()
+        pending_approvals[tool_call_id] = fut
+        reason = "deny"
+        try:
+            approved = await asyncio.wait_for(fut, timeout=300.0)
+            reason = "allow" if approved else "deny"
+            return approved
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Approval timeout for {tool_name} (call {tool_call_id}, session={session_id})"
+            )
+            reason = "timeout"
+            return False
+        finally:
+            pending_approvals.pop(tool_call_id, None)
+            await _safe_send({
+                "type": "approval_resolved",
+                "tool_call_id": tool_call_id,
+                "tool": tool_name,
+                "approved": reason == "allow",
+                "reason": reason,
+            })
+
     try:
         while True:
             data = await websocket.receive_json()
@@ -242,11 +302,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
                 # Serial execution — acquire session lock
                 async with session.lock:
-                    async for event in agent.run(session, content, mode=effective_mode):
+                    async for event in agent.run(
+                        session, content,
+                        mode=effective_mode,
+                        approval_callback=ws_approval_callback,
+                    ):
                         await websocket.send_json({
                             "type": event.type,
                             **event.data,
                         })
+
+            elif data.get("type") == "approval_response":
+                tc_id = data.get("tool_call_id")
+                approved = bool(data.get("approved", False))
+                fut = pending_approvals.get(tc_id)
+                if fut and not fut.done():
+                    fut.set_result(approved)
+                else:
+                    logger.warning(
+                        f"approval_response for unknown or resolved tool_call_id: {tc_id}"
+                    )
 
             elif data.get("type") == "approve_plan":
                 # User approved the plan — transition to execution phase
@@ -261,7 +336,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     approval_msg += f"\n\nAdditional notes from user: {feedback}"
                 logger.info(f"Plan approved for session={session_id}, transitioning to execution phase")
                 async with session.lock:
-                    async for event in agent.run(session, approval_msg, mode="deep_work"):
+                    async for event in agent.run(
+                        session, approval_msg,
+                        mode="deep_work",
+                        approval_callback=ws_approval_callback,
+                    ):
                         await websocket.send_json({
                             "type": event.type,
                             **event.data,
@@ -274,7 +353,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     continue
                 logger.info(f"Plan revision requested for session={session_id}")
                 async with session.lock:
-                    async for event in agent.run(session, feedback, mode="deep_work"):
+                    async for event in agent.run(
+                        session, feedback,
+                        mode="deep_work",
+                        approval_callback=ws_approval_callback,
+                    ):
                         await websocket.send_json({
                             "type": event.type,
                             **event.data,
@@ -310,6 +393,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             await websocket.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+    finally:
+        # Resolve any outstanding approval Futures so awaiting tasks unblock
+        # immediately instead of waiting for the 5-minute timeout.
+        for fut in pending_approvals.values():
+            if not fut.done():
+                fut.set_result(False)
+        pending_approvals.clear()
 
 
 # ─── HTTP REST API ───
@@ -328,8 +418,17 @@ async def chat(session_id: str, body: dict):
     chat_mode = body.get("mode")
     session = session_mgr.get_or_create(session_id)
 
+    http_approval = build_policy_callback(
+        config.agent.tools.non_interactive_approval_policy,
+        f"http:{session_id}",
+    )
+
     async with session.lock:
-        response_text = await agent.run_simple(session, message, mode=chat_mode)
+        response_text = await agent.run_simple(
+            session, message,
+            mode=chat_mode,
+            approval_callback=http_approval,
+        )
 
     return JSONResponse({
         "response": response_text,
