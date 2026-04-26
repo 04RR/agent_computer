@@ -37,6 +37,26 @@ PLANNING_TOOLS = {
     "web_search",      # read-only lookup (fetching full pages waits for execution)
 }
 
+# In verify mode the planner can also peek at the input it'll be reasoning
+# about — extract_caption_claims is read-only and the rest of the verify
+# tools are deferred until the execution phase.
+VERIFY_PLANNING_TOOLS = {
+    "manage_tasks",
+    "extract_caption_claims",
+}
+
+
+def _allowed_tools_for_mode(agent_cfg, mode: str) -> list[str]:
+    """Resolve the per-mode tool allow list.
+
+    Verify mode is exclusively the five verification tools + manage_tasks
+    for DAG authoring. No web_search, no shell, no file tools.
+    Other modes fall through to the global agent.tools.allow.
+    """
+    if mode == "verify":
+        return list(agent_cfg.tools.verification_tools) + ["manage_tasks"]
+    return list(agent_cfg.tools.allow)
+
 # ─── Activity broadcasting ───
 _activity_log: deque[dict] = deque(maxlen=200)
 _activity_listeners: list[asyncio.Queue] = []
@@ -170,6 +190,8 @@ class AgentRuntime:
         # Resolve mode: explicit param > session mode > default
         effective_mode = mode or session.mode
         is_deep_work = effective_mode == "deep_work"
+        is_verify = effective_mode == "verify"
+        is_dag_mode = is_deep_work or is_verify  # both use planning → executing
         logger.info(f"Agent.run() session={session.session_id} mode_param={mode} session_mode={session.mode} effective={effective_mode}")
 
         # 1. Add user message to session
@@ -177,11 +199,21 @@ class AgentRuntime:
 
         # 2. Determine limits based on mode and phase
         is_planning = False
-        if is_deep_work:
+        if is_dag_mode:
             session.begin_deep_work_if_needed()
             is_planning = session.deep_work_phase == "planning"
 
-            if is_planning:
+            if is_verify:
+                # Verify mode: short, bounded budgets. No token budget
+                # enforcement — verification doesn't run long enough to need it.
+                max_iterations = (
+                    self.config.agent.verify.planning_max_iterations
+                    if is_planning
+                    else self.config.agent.verify.max_iterations
+                )
+                token_budget = 0
+                warning_threshold = 0
+            elif is_planning:
                 max_iterations = min(30, self.config.agent.deep_work.max_iterations)
                 token_budget = 0  # No budget enforcement during planning
                 warning_threshold = 0
@@ -196,24 +228,26 @@ class AgentRuntime:
 
         # 3. Build tool context for this run (replaces global task store binding)
         tool_context = {
-            "task_store": session.task_store if is_deep_work else None,
+            "task_store": session.task_store if is_dag_mode else None,
             "mode": effective_mode,
             "session_id": session.session_id,
         }
 
-        # 4. Build tool schemas — filter by mode and deep-work phase
-        allowed_tools = list(self.agent_config.tools.allow)
-        if not is_deep_work and "manage_tasks" in allowed_tools:
+        # 4. Build tool schemas — mode-aware allow list, then phase-specific filter
+        allowed_tools = _allowed_tools_for_mode(self.agent_config, effective_mode)
+        if not is_dag_mode and "manage_tasks" in allowed_tools:
             allowed_tools.remove("manage_tasks")
         if is_planning:
             # Planning phase: restrict to research/lookup tools only.
             # Write tools (write_file, shell) and deep-fetch tools (web_fetch*)
-            # are physically invisible until the user approves the plan.
-            allowed_tools = [t for t in allowed_tools if t in PLANNING_TOOLS]
+            # are physically invisible until the plan is approved.
+            planning_set = VERIFY_PLANNING_TOOLS if is_verify else PLANNING_TOOLS
+            allowed_tools = [t for t in allowed_tools if t in planning_set]
         tool_schemas = self.tools.get_openai_tools(allowed=allowed_tools)
 
         # 5. Cache static context (read files once per run, not every iteration)
-        static_ctx = load_static_context(self.agent_config.workspace)
+        # Mode-aware: verify mode prefers verification_soul.md.
+        static_ctx = load_static_context(self.agent_config.workspace, mode=effective_mode)
         tool_name_list = [t.name for t in self.tools.list_tools() if t.name in allowed_tools]
 
         # 6. Search relevant memories for this user message (once per run)
@@ -252,7 +286,7 @@ class AgentRuntime:
             user_message=user_message,
         )
 
-        if is_deep_work:
+        if is_dag_mode:
             static_prefix = build_static_prompt_prefix(ctx)
             ctx.task_summary = session.task_store.summary()
             ctx.pending_task_count = session.task_store.pending_count()
@@ -279,8 +313,9 @@ class AgentRuntime:
             iteration += 1
             logger.info(f"Agent loop iteration {iteration}/{max_iterations} (mode={effective_mode})")
 
-            # Deep work: rebuild dynamic suffix each iteration (static prefix is cached)
-            if is_deep_work and iteration > 1:
+            # DAG modes (deep_work + verify): rebuild dynamic suffix each iteration
+            # (static prefix is cached).
+            if is_dag_mode and iteration > 1:
                 ctx.task_summary = session.task_store.summary()
                 ctx.pending_task_count = session.task_store.pending_count()
                 ctx.budget_warning = ""
@@ -305,9 +340,9 @@ class AgentRuntime:
                 suffix = build_dynamic_suffix(ctx)
                 system_prompt = static_prefix + ("\n\n" + suffix if suffix else "")
 
-            # Emit thinking event (enhanced in deep-work mode)
+            # Emit thinking event (enhanced for DAG modes — both deep_work and verify)
             thinking_data: dict[str, Any] = {"iteration": iteration}
-            if is_deep_work:
+            if is_dag_mode:
                 thinking_data.update({
                     "max_iterations": max_iterations,
                     "tokens_used": run_usage["total_tokens"],
@@ -483,7 +518,7 @@ class AgentRuntime:
                     dur = round((time.monotonic() - t0) * 1000)
                     return res, dur
 
-                if is_deep_work:
+                if is_dag_mode:
                     session.task_store._auto_save = False
                 try:
                     logger.info(f"Executing {len(parsed_calls)} tool(s) in parallel: {[n for _, n, _ in parsed_calls]}")
@@ -491,7 +526,7 @@ class AgentRuntime:
                         *(_exec_tool(tc, name, args) for tc, name, args in parsed_calls)
                     )
                 finally:
-                    if is_deep_work:
+                    if is_dag_mode:
                         session.task_store._auto_save = True
                         session.task_store.flush()
 
@@ -521,8 +556,8 @@ class AgentRuntime:
                     # Add tool result to session
                     session.add_message("tool", result, tool_call_id=tool_call.id, tool_name=tool_name)
 
-                    # Emit task_update event after manage_tasks execution
-                    if tool_name == "manage_tasks" and is_deep_work:
+                    # Emit task_update event after manage_tasks execution (both DAG modes)
+                    if tool_name == "manage_tasks" and is_dag_mode:
                         yield AgentEvent("task_update", {
                             "tasks": session.task_store.to_dict(),
                             "summary": session.task_store.summary(),
@@ -571,13 +606,13 @@ class AgentRuntime:
                 consecutive_identical_batches = 0
                 last_batch_signature = None
 
-            # Deep work execution phase: don't exit if there are still pending tasks
-            if is_deep_work and not is_planning:
+            # DAG-mode execution: don't exit if there are still pending tasks
+            if is_dag_mode and not is_planning:
                 pending_count_now = session.task_store.pending_count()
                 if pending_count_now > 0 and consecutive_text_only < 2:
                     consecutive_text_only += 1
                     logger.info(
-                        f"Deep work: text-only response but {pending_count_now} tasks remain "
+                        f"DAG mode ({effective_mode}): text-only response but {pending_count_now} tasks remain "
                         f"(consecutive_text_only={consecutive_text_only}). Injecting nudge."
                     )
                     pending_tasks = [t for t in session.task_store.list_all()

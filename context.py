@@ -276,21 +276,41 @@ The user has approved your plan. Execute it now.
 DEEP_WORK_INSTRUCTIONS = DEEP_WORK_PLANNING_INSTRUCTIONS
 
 
-def load_static_context(workspace: str) -> dict:
+def load_static_context(workspace: str, mode: str | None = None) -> dict:
     """Read static workspace files once per run. Returns dict to unpack into build_system_prompt.
 
     Keys: soul_content, user_content, static_memory_fallback
+
+    The SOUL file is mode-aware: verify mode loads ``verification_soul.md``
+    when present, falling back to ``SOUL.md``. Other modes always read
+    ``SOUL.md``. USER.md and the memory fallbacks are mode-independent.
     """
     workspace_path = Path(workspace)
     result = {"soul_content": "", "user_content": "", "static_memory_fallback": ""}
 
-    for fname, key in [("SOUL.md", "soul_content"), ("USER.md", "user_content")]:
+    # Pick the soul file based on mode. Fall back to SOUL.md if the
+    # mode-specific file is missing (so verify mode still works on a fresh
+    # workspace before the verification SOUL is created).
+    if mode == "verify":
+        soul_candidates = ("verification_soul.md", "SOUL.md")
+    else:
+        soul_candidates = ("SOUL.md",)
+
+    for fname in soul_candidates:
         path = workspace_path / fname
         if path.exists():
             content = path.read_text(encoding="utf-8").strip()
             if content:
-                result[key] = content
-                logger.debug(f"Loaded {fname} ({len(content)} chars)")
+                result["soul_content"] = content
+                logger.debug(f"Loaded {fname} ({len(content)} chars) for mode={mode!r}")
+                break
+
+    user_path = workspace_path / "USER.md"
+    if user_path.exists():
+        content = user_path.read_text(encoding="utf-8").strip()
+        if content:
+            result["user_content"] = content
+            logger.debug(f"Loaded USER.md ({len(content)} chars)")
 
     # Static memory fallback (used when MemorySearch is unavailable)
     memory_dir = workspace_path / "memory"
@@ -360,8 +380,8 @@ one operation depends on another's output.""")
             "</available_tools>"
         )
 
-    # 4.5. Parallel tool usage examples (deep work mode only)
-    if ctx.mode == "deep_work":
+    # 4.5. Parallel tool usage examples (deep work + verify both use DAGs)
+    if ctx.mode in ("deep_work", "verify"):
         parts.append("""<parallel_tool_examples>
 GOOD - Batched (1 iteration):
 Call web_fetch("url1"), web_fetch("url2"), web_fetch("url3") in ONE response
@@ -400,8 +420,10 @@ When NOT to batch:
     if ctx.session_summary:
         parts.append(f"<session_context>\nThis session so far: {ctx.session_summary}\n</session_context>")
 
-    # 7. Deep work instructions (phase-aware)
-    if ctx.mode == "deep_work":
+    # 7. DAG-mode instructions (phase-aware). Verify mode reuses the same
+    # DAG planning/execution mechanics — verification IS a fan-out/gather/
+    # synthesize task. The verification SOUL provides the domain framing.
+    if ctx.mode in ("deep_work", "verify"):
         if ctx.deep_work_phase == "executing":
             parts.append(DEEP_WORK_EXECUTION_INSTRUCTIONS)
         else:

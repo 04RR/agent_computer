@@ -70,11 +70,18 @@ register_web_search_tool(tool_registry, allowed=allowed_tools)
 if config.pinchtab.enabled:
     from tools.pinchtab import register_pinchtab_tools
     register_pinchtab_tools(tool_registry, config.agent.workspace, allowed=allowed_tools, pinchtab_config=config.pinchtab)
-# Verification-mode tools (Phase 1): registered unconditionally so the
-# /api/verify/raw endpoint can call them, but absent from agent.tools.allow
-# so the agent loop can't see them yet. Phase 2 will flip them on for agent use.
+# Verification tools — registered unconditionally. The agent only sees
+# them when a session is in mode="verify" (per _allowed_tools_for_mode in
+# agent.py). The /api/verify/raw endpoint also calls them directly.
+# agent_getter is a closure so the LLM tools can resolve agent.client at
+# call time, after `agent` is constructed below.
 from tools.verification import register_verification_tools
-register_verification_tools(tool_registry, config.agent.workspace, config.verification)
+register_verification_tools(
+    tool_registry,
+    config.agent.workspace,
+    config.verification,
+    agent_getter=lambda: agent,
+)
 if config.verification.tineye_stub_mode != "off":
     logger.warning(
         f"tineye_stub_mode={config.verification.tineye_stub_mode!r} "
@@ -514,6 +521,98 @@ async def verify_raw(image: UploadFile = File(...), caption: str = Form(...)):
         "errors": errors,
         "elapsed_ms": elapsed_ms,
     })
+
+
+@app.post("/api/verify")
+async def verify_with_agent(image: UploadFile = File(...), caption: str = Form(...)):
+    """Run a full verification flow — agent loop with the five verification tools.
+
+    Phase 2 endpoint. Differs from /api/verify/raw:
+      - Creates a session in mode="verify"
+      - Builds a DAG plan (planning phase, auto-approved)
+      - Executes the DAG and produces a structured Markdown report
+      - Returns the final report when complete (blocking HTTP)
+
+    /api/verify/raw is kept for direct tool testing without the agent.
+    """
+    t0 = time.monotonic()
+
+    upload_dir = Path(config.agent.workspace) / ".verify_uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = Path(image.filename or "").suffix or ".jpg"
+    image_id = f"{uuid.uuid4().hex}{ext}"
+    image_path = upload_dir / image_id
+    contents = await image.read()
+    image_path.write_bytes(contents)
+
+    session_id = f"verify-{uuid.uuid4().hex[:8]}"
+    session = session_mgr.get_or_create(session_id)
+    session.set_mode("verify")
+
+    initial_msg = (
+        "VERIFICATION REQUEST\n\n"
+        f"Image path: {image_path}\n"
+        f"Caption: {caption}\n\n"
+        "Produce a structured verification report following the workflow in "
+        "your identity. Plan the DAG first, then execute and synthesize."
+    )
+
+    # Phase 1: planning. Capture plan_ready so we can auto-approve.
+    plan_ready_event: dict | None = None
+    final_text = ""
+    error_message: str | None = None
+    iteration_total = 0
+    plan_tasks: list[dict] = []
+
+    async with session.lock:
+        async for event in agent.run(session, initial_msg, mode="verify"):
+            if event.type == "plan_ready":
+                plan_ready_event = dict(event.data)
+            elif event.type == "error":
+                error_message = event.data.get("message", "unknown error")
+            elif event.type == "done":
+                # Planning shouldn't reach 'done' before plan_ready in DAG modes,
+                # but if it does (e.g. trivial single-step) accept the text.
+                final_text = event.data.get("text", "")
+                iteration_total += event.data.get("iterations", 0)
+
+        # Phase 2: execution — only if planning produced a plan
+        if plan_ready_event is not None and error_message is None:
+            try:
+                session.approve_plan()
+            except ValueError as e:
+                error_message = f"could not auto-approve plan: {e}"
+            else:
+                plan_tasks = plan_ready_event.get("tasks") or []
+                approval_msg = (
+                    "[VERIFY MODE] Plan approved automatically. Execute the DAG "
+                    "and produce the final structured report."
+                )
+                async for event in agent.run(session, approval_msg, mode="verify"):
+                    if event.type == "done":
+                        final_text = event.data.get("text", "") or final_text
+                        iteration_total += event.data.get("iterations", 0)
+                    elif event.type == "error":
+                        error_message = event.data.get("message", "unknown error")
+
+    elapsed_ms = round((time.monotonic() - t0) * 1000)
+
+    payload: dict = {
+        "session_id": session_id,
+        "image_path": str(image_path),
+        "caption": caption,
+        "report": final_text,
+        "tasks": session.get_tasks(),
+        "plan_tasks": plan_tasks,
+        "iterations": iteration_total,
+        "elapsed_ms": elapsed_ms,
+        "stub_mode": config.verification.tineye_stub_mode,
+    }
+    if error_message:
+        payload["error"] = error_message
+        return JSONResponse(payload, status_code=500)
+    return JSONResponse(payload)
 
 
 @app.get("/api/sessions")

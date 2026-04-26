@@ -64,7 +64,7 @@ class Message:
 class Session:
     """A single conversation session with JSONL persistence and serial execution."""
 
-    VALID_MODES: ClassVar[set[str]] = {"bounded", "deep_work"}
+    VALID_MODES: ClassVar[set[str]] = {"bounded", "deep_work", "verify"}
     VALID_PHASES: ClassVar[set[str | None]] = {None, "planning", "executing"}
 
     def __init__(self, session_id: str, storage_dir: str):
@@ -111,14 +111,18 @@ class Session:
         self.deep_work_phase = None
 
     def begin_deep_work_if_needed(self) -> None:
-        """Called at the start of a deep_work run. Sets phase to 'planning' if unset."""
-        if self.mode == "deep_work" and self.deep_work_phase is None:
+        """Called at the start of a deep_work or verify run. Sets phase to 'planning' if unset.
+
+        Both modes use the planning → executing state machine; verify mode just
+        skips the user-approval gate at the gateway layer.
+        """
+        if self.mode in ("deep_work", "verify") and self.deep_work_phase is None:
             self.deep_work_phase = "planning"
 
     def approve_plan(self) -> None:
         """Transition planning → executing. Raises if not in valid state."""
-        if self.mode != "deep_work":
-            raise ValueError("Cannot approve plan outside deep_work mode")
+        if self.mode not in ("deep_work", "verify"):
+            raise ValueError("Cannot approve plan outside deep_work or verify mode")
         if self.deep_work_phase != "planning":
             raise ValueError(f"Cannot approve plan from phase {self.deep_work_phase!r}")
         self.deep_work_phase = "executing"

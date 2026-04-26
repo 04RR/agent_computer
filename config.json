@@ -36,6 +36,10 @@
       "max_iterations": 200,
       "token_budget": 1500000,
       "warning_threshold": 0.8
+    },
+    "verify": {
+      "max_iterations": 20,
+      "planning_max_iterations": 10
     }
   },
   "sessions": {

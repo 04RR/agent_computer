@@ -40,6 +40,8 @@ class ToolsConfig(BaseModel):
         "reverse_image_search",
         "extract_image_metadata",
         "fact_check_lookup",
+        "extract_caption_claims",
+        "reconcile_image_with_caption",
     ])
     shell_blocked_commands: list[str] = Field(default_factory=lambda: [
         "rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:", "> /dev/sda",
@@ -53,6 +55,13 @@ class DeepWorkConfig(BaseModel):
     max_iterations: int = 200
     token_budget: int = 500000
     warning_threshold: float = 0.8
+
+
+class VerifyConfig(BaseModel):
+    """Iteration limits for verify mode. Verification is bounded work — if the
+    agent is making more than ~20 LLM calls, something is wrong."""
+    max_iterations: int = 20
+    planning_max_iterations: int = 10
 
 
 class ReflectionConfig(BaseModel):
@@ -99,6 +108,7 @@ class AgentConfig(BaseModel):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     max_loop_iterations: int = 15
     deep_work: DeepWorkConfig = Field(default_factory=DeepWorkConfig)
+    verify: VerifyConfig = Field(default_factory=VerifyConfig)
 
 
 class SessionsConfig(BaseModel):
