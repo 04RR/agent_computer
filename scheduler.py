@@ -502,8 +502,12 @@ when the count is zero.
 
 ### Reconciliation
 For each dimension (when / where / who / what), one short paragraph:
-the caption's claim, the evidence, the verdict, and one sentence of
-reasoning. Pull from the reconcile_image_with_caption task output.
+the caption's claim, the evidence, the verdict (consistent /
+contradicts / inconclusive), and one sentence of reasoning. You
+perform the cross-check yourself directly from the four task
+outputs — there is no separate reconcile tool result. "Inconclusive"
+is the default whenever evidence is missing or mixed; do not promote
+to "consistent" without affirmative evidence.
 
 ### Bottom line
 One paragraph summarizing what the evidence suggests. NOT a binary

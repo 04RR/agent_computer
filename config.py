@@ -41,7 +41,6 @@ class ToolsConfig(BaseModel):
         "extract_image_metadata",
         "fact_check_lookup",
         "extract_caption_claims",
-        "reconcile_image_with_caption",
     ])
     shell_blocked_commands: list[str] = Field(default_factory=lambda: [
         "rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:", "> /dev/sda",

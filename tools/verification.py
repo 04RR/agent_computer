@@ -572,48 +572,6 @@ Respond with valid JSON only. No markdown fences, no commentary outside the JSON
 """
 
 
-_RECONCILE_SYSTEM_PROMPT = """\
-You evaluate whether evidence about an image's web history and metadata
-is consistent with the claims a caption makes about that image.
-
-For each of the four claim dimensions (when, where, who, what), produce
-a verdict from this fixed set:
-
-- "consistent"   — the evidence affirmatively supports the claim
-                   (matching dates, matching locations, matching subjects).
-- "contradicts"  — the evidence shows the claim is wrong
-                   (older crawl dates, different location, different subject).
-- "inconclusive" — the default. Use whenever evidence is missing or mixed.
-
-CRITICAL framing rules:
-
-1. "No web matches" does NOT mean "fake" or "AI-generated". A real photo
-   taken minutes ago will also have no web history. When reverse_search
-   returns no matches, that dimension is INCONCLUSIVE on its own — it is
-   never sufficient evidence to contradict a recency claim.
-
-2. Crawl dates older than the caption's claimed time window contradict
-   the WHEN claim. That IS a "contradicts" verdict.
-
-3. Domains matching the caption's claimed source/region (e.g. caption
-   mentions "Mumbai" and reverse search finds matches on Indian news
-   outlets) support the WHERE claim.
-
-4. EXIF datetime in the future or AI-generator software in the metadata
-   are red flags worth surfacing in key_findings, even if you don't have
-   enough to flip a verdict.
-
-5. The overall_consistency value must be one of: "consistent",
-   "contradictions", "inconclusive", "mixed".
-   - "consistent"     — all dimensions consistent or one inconclusive.
-   - "contradictions" — at least one dimension contradicts.
-   - "mixed"          — some consistent, some contradicts.
-   - "inconclusive"   — most dimensions inconclusive, no clear signal.
-
-Respond with valid JSON only. No markdown fences.
-"""
-
-
 async def _llm_json_call(
     client,
     model_id: str,
@@ -670,12 +628,16 @@ def register_verification_tools(
     also calls them directly via registry.execute().
 
     ``agent_getter`` is a zero-arg callable that returns the live
-    AgentRuntime. The two LLM-based tools (extract_caption_claims,
-    reconcile_image_with_caption) call ``agent_getter().client`` to
-    reuse the agent's OpenAI-compatible client (so runtime model
-    switches via /api/models/select are honored). When agent_getter
-    is None (e.g. during smoke tests that don't need LLM tools), the
-    LLM tools return a structured error instead of crashing.
+    AgentRuntime. The LLM-based tool (extract_caption_claims) calls
+    ``agent_getter().client`` to reuse the agent's OpenAI-compatible
+    client (so runtime model switches via /api/models/select are
+    honored). When agent_getter is None (e.g. during smoke tests that
+    don't need LLM tools), the LLM tool returns a structured error
+    instead of crashing.
+
+    Note: reconcile_image_with_caption was removed in the Phase 2
+    cleanup — synthesis does the cross-check work directly from
+    gathered evidence. The DAG is now four evidence tools + gather.
     """
     api_url = verification_config.tineye_api_url
     tineye_key = verification_config.tineye_api_key
@@ -877,86 +839,4 @@ def register_verification_tools(
             ToolParam("caption", "string", "The caption text to decompose"),
         ],
         handler=extract_caption_claims,
-    ))
-
-    # ── reconcile_image_with_caption (LLM) ──
-    async def reconcile_image_with_caption(
-        claims: dict,
-        reverse_search: dict,
-        metadata: dict,
-        fact_check: dict,
-    ) -> str:
-        if agent_getter is None:
-            return json.dumps({
-                "error": "reconcile_image_with_caption requires an LLM client (agent_getter not provided)",
-                "tool": "reconcile_image_with_caption",
-            })
-        try:
-            agent = agent_getter()
-            client = agent.client
-            model_id = agent.agent_config.model.model_id
-            provider = agent.agent_config.model.provider
-        except Exception as e:
-            return json.dumps({
-                "error": f"could not resolve LLM client: {e}",
-                "tool": "reconcile_image_with_caption",
-            })
-
-        # Pull stub_used as a passthrough so Phase 3 UI can badge stubbed runs.
-        stub_used = bool(reverse_search.get("_stub")) if isinstance(reverse_search, dict) else False
-        fact_check_matches = (
-            int(fact_check.get("match_count", 0))
-            if isinstance(fact_check, dict)
-            else 0
-        )
-
-        user_prompt = (
-            "Evaluate each caption claim dimension against the available evidence.\n\n"
-            f"=== CAPTION CLAIMS ===\n{json.dumps(claims, indent=2)}\n\n"
-            f"=== REVERSE IMAGE SEARCH ===\n{json.dumps(reverse_search, indent=2)}\n\n"
-            f"=== IMAGE METADATA ===\n{json.dumps(metadata, indent=2)}\n\n"
-            f"=== FACT CHECK MATCHES ===\n{json.dumps(fact_check, indent=2)}\n\n"
-            "Respond with JSON matching this exact schema:\n"
-            '{\n'
-            '  "dimensions": {\n'
-            '    "when":  {"claim": str, "evidence": str, "verdict": "consistent"|"contradicts"|"inconclusive", "reasoning": str},\n'
-            '    "where": {"claim": str, "evidence": str, "verdict": "consistent"|"contradicts"|"inconclusive", "reasoning": str},\n'
-            '    "who":   {"claim": str, "evidence": str, "verdict": "consistent"|"contradicts"|"inconclusive", "reasoning": str},\n'
-            '    "what":  {"claim": str, "evidence": str, "verdict": "consistent"|"contradicts"|"inconclusive", "reasoning": str}\n'
-            '  },\n'
-            '  "overall_consistency": "consistent"|"contradictions"|"inconclusive"|"mixed",\n'
-            '  "key_findings": [str, ...]\n'
-            '}'
-        )
-        try:
-            result = await _llm_json_call(
-                client, model_id, provider,
-                _RECONCILE_SYSTEM_PROMPT, user_prompt,
-                max_tokens=2048,
-            )
-            # Augment with passthrough fields the LLM doesn't produce.
-            result["fact_check_matches"] = fact_check_matches
-            result["stub_used"] = stub_used
-            return json.dumps(result)
-        except Exception as e:
-            logger.warning(f"reconcile_image_with_caption failed: {e}")
-            return json.dumps({"error": str(e), "tool": "reconcile_image_with_caption"})
-
-    registry.register(Tool(
-        name="reconcile_image_with_caption",
-        description=(
-            "Cross-check structured caption claims against gathered evidence "
-            "(reverse-image-search results, EXIF metadata, fact-check matches) "
-            "and return a per-dimension reconciliation. Each dimension's verdict "
-            "is consistent / contradicts / inconclusive. 'No web matches' is "
-            "INCONCLUSIVE on its own — it is not evidence of fakery. The "
-            "stub_used field passes through whether reverse_search was stubbed."
-        ),
-        params=[
-            ToolParam("claims", "object", "Output of extract_caption_claims"),
-            ToolParam("reverse_search", "object", "Output of reverse_image_search"),
-            ToolParam("metadata", "object", "Output of extract_image_metadata"),
-            ToolParam("fact_check", "object", "Output of fact_check_lookup"),
-        ],
-        handler=reconcile_image_with_caption,
     ))

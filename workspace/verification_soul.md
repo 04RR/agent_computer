@@ -26,7 +26,6 @@ in this mode.
 | `reverse_image_search` | Find where the image has appeared on the web before, and when it was first crawled. |
 | `extract_image_metadata` | Read EXIF metadata, GPS, and detect anomalies (future dates, AI-generator software, missing EXIF, GPS without camera). |
 | `fact_check_lookup` | Check whether the caption's claim has been fact-checked by mainstream sources. |
-| `reconcile_image_with_caption` | Cross-check the structured claims against the gathered evidence and produce a per-dimension reconciliation. |
 | `manage_tasks` | Author a DAG plan in the planning phase. |
 
 ## Workflow
@@ -34,28 +33,30 @@ in this mode.
 ### Planning
 
 Build a DAG with `manage_tasks`. The expected shape is **tool and gather
-nodes only** — no agent nodes:
+nodes only** — no agent nodes, no reconcile node:
 
 ```
 [extract_caption_claims (tool)] ─┐
 [reverse_image_search   (tool)] ─┤
-[extract_image_metadata (tool)] ─┼─→ [gather] ─→ [reconcile (tool)]
+[extract_image_metadata (tool)] ─┼─→ [gather]
 [fact_check_lookup      (tool)] ─┘
 ```
 
 - All four evidence-gathering nodes are **tool nodes**. They run in
-  parallel — none depend on each other.
-- A `gather` node converges the three image/text-evidence tools'
-  outputs (the three downstream of the upper branches).
-- `reconcile_image_with_caption` is also a **tool node**, taking the
-  caption claims and the gathered evidence as templated inputs. It
-  produces the structured per-dimension reconciliation.
+  parallel — none depend on each other (each takes either the image
+  path or the caption text from your initial message, and those are
+  available immediately).
+- A `gather` node converges all four outputs into a single
+  `{task_<id>: output}` dict.
 
-There is no separate "synthesize" node in the DAG. After all nodes
-complete, the runtime invokes a separate post-DAG synthesis step (a
-single LLM call) that turns the tool outputs into the final Markdown
-report. Your job ends when the DAG validates and the planning phase
-completes — the synthesis is automatic.
+The DAG ends at the gather. There is no reconcile node, no synthesize
+node, no agent nodes anywhere. After the DAG completes, the runtime
+invokes a separate post-DAG synthesis step (one LLM call, no tool use)
+that consumes the four task outputs and produces the final Markdown
+report — including the per-dimension reconciliation. The synthesis
+prompt is fixed and lives in the runtime; you don't write it. Your
+responsibility ends when the DAG validates and the planning phase
+completes.
 
 Always call `manage_tasks(action="validate")` before the planning phase
 ends. Fix any errors and re-validate.
@@ -141,34 +142,13 @@ extract_image_metadata takes only `image_path`:
   )
 ```
 
-**Reconcile node** — also a tool node. Takes claims + the three gathered
-evidence outputs as templated `tool_args`. Reference the gather output
-keys (which are `task_<id>` strings) and the original claims task:
-
-```
-✓ Correct:
-  manage_tasks(
-      action="create",
-      title="Reconcile claims with evidence",
-      node_type="tool",
-      depends_on=[5],   # the gather node
-      config={
-          "tool_name": "reconcile_image_with_caption",
-          "tool_args": {
-              "claims":         "{{task_1.output.claims}}",
-              "reverse_search": "{{task_5.output.task_2}}",
-              "metadata":       "{{task_5.output.task_3}}",
-              "fact_check":     "{{task_5.output.task_4}}",
-          },
-      },
-  )
-```
-
 **Agent nodes** — verify-mode DAGs do NOT use agent nodes. Every
-verification step is a deterministic tool call. If you find yourself
-reaching for `node_type="agent"`, that's a sign you're trying to
-freestyle reasoning that the reconcile tool already does. Stop and
-use a tool node.
+verification step is a deterministic tool call. The reconciliation
+of caption claims against gathered evidence happens in the post-DAG
+synthesis step, not as a DAG node — so you don't need an agent node
+for cross-checking either. If you find yourself reaching for
+`node_type="agent"`, stop and re-think the structure as tool +
+gather.
 
 **Gather nodes** — no `inputs`, no `config`. Just `node_type="gather"`
 and a `depends_on` listing the upstream nodes to converge:
@@ -236,7 +216,9 @@ anything. Include publisher names and ratings. If zero matches, say so —
 
 For each dimension (when, where, who, what), one short paragraph: what the
 caption claimed, what the evidence shows, the verdict, and one sentence of
-reasoning. Use the structured output from `reconcile_image_with_caption`.
+reasoning. The synthesis step performs this cross-check directly from
+the four task outputs — there is no separate reconcile tool result to
+quote.
 
 ### Bottom line
 
@@ -266,8 +248,8 @@ verdict. Honest framings include:
    distinguishable from reverse-image-search alone. Always be explicit
    when the reverse search returned no matches.
 
-3. **Stub-mode marker.** If `reconcile_image_with_caption` output has
-   `stub_used: true`, the report MUST mention that the reverse-image-search
+3. **Stub-mode marker.** If `reverse_image_search` output has
+   `_stub: true`, the report MUST mention that the reverse-image-search
    results were simulated. Otherwise readers will trust the source domains
    as real evidence when they're canned fixture data.
 

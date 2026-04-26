@@ -116,7 +116,6 @@ def main(base_url: str = "http://localhost:8000") -> None:
         "reverse_image_search",
         "extract_image_metadata",
         "fact_check_lookup",
-        "reconcile_image_with_caption",
     }
     for tool_name, n in tool_call_counts.items():
         if tool_name in expected_tools and n > 1:
