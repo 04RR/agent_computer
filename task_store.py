@@ -69,7 +69,11 @@ class TaskStore:
     Supports deferred saves via _auto_save flag for batch operations.
     """
 
-    VALID_STATUSES = {"pending", "in_progress", "completed", "blocked"}
+    # "blocked" was already reserved for human-set "this task is on hold"
+    # cases. Week 2's scheduler also uses "blocked" to mark transitive
+    # dependents of a failed task. "failed" is new — set by the scheduler
+    # when a task crashes during dispatch.
+    VALID_STATUSES = {"pending", "in_progress", "completed", "blocked", "failed"}
     VALID_NODE_TYPES = {"agent", "tool", "gather"}
 
     def __init__(self, persistence_path: str | Path):
@@ -216,6 +220,94 @@ class TaskStore:
 
     def completed_list(self) -> list[Task]:
         return [t for t in self.list_all() if t.status == "completed"]
+
+    # ── DAG scheduler hooks (Week 2) ──
+
+    def list_ready(self) -> list[Task]:
+        """Return tasks the scheduler is allowed to dispatch right now:
+        pending, with every dependency completed.
+
+        Used by DagScheduler to find dispatchable tasks each iteration.
+        """
+        completed_ids = {t.id for t in self._tasks.values() if t.status == "completed"}
+        ready: list[Task] = []
+        for t in self.list_all():
+            if t.status != "pending":
+                continue
+            if all(dep in completed_ids for dep in t.depends_on):
+                ready.append(t)
+        return ready
+
+    def set_output(self, task_id: int, output: Any) -> None:
+        """Set task.output. Persists immediately. The scheduler calls this
+        on tool / gather / agent node completion so downstream templates
+        can resolve into the structure."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        task.output = output if output is not None else {}
+        self._invalidate_caches()
+        self._maybe_save()
+
+    def set_status(self, task_id: int, status: str) -> None:
+        """Set task.status with status-counter bookkeeping. Persists
+        immediately. Silently ignored for unknown statuses."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        if status not in self.VALID_STATUSES:
+            logger.warning(f"set_status: unknown status {status!r} for task {task_id}, ignoring")
+            return
+        old = task.status
+        if old == status:
+            return
+        task.status = status
+        self._status_counts[old] = max(0, self._status_counts.get(old, 0) - 1)
+        self._status_counts[status] = self._status_counts.get(status, 0) + 1
+        self._invalidate_caches()
+        self._maybe_save()
+
+    def set_error(self, task_id: int, error: str) -> None:
+        """Mark a task failed with a structured error message. Persists."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        task.result = f"ERROR: {error}"
+        # Use set_status to keep counters consistent
+        self.set_status(task_id, "failed")
+
+    def mark_blocked_dependents(self, failed_task_id: int) -> list[int]:
+        """When a task fails, mark every transitive dependent as 'blocked'
+        so the scheduler doesn't try to dispatch them.
+
+        Returns the list of newly-blocked task ids for logging.
+        """
+        # Build reverse adjacency once.
+        downstream: dict[int, list[int]] = {tid: [] for tid in self._tasks}
+        for t in self._tasks.values():
+            for dep in t.depends_on:
+                if dep in downstream:
+                    downstream[dep].append(t.id)
+
+        # BFS forward from the failed task.
+        blocked: list[int] = []
+        visited: set[int] = set()
+        queue: list[int] = list(downstream.get(failed_task_id, []))
+        while queue:
+            tid = queue.pop(0)
+            if tid in visited:
+                continue
+            visited.add(tid)
+            t = self._tasks.get(tid)
+            if t is None:
+                continue
+            # Don't re-block tasks that are already terminal.
+            if t.status in ("completed", "failed"):
+                continue
+            self.set_status(tid, "blocked")
+            blocked.append(tid)
+            queue.extend(downstream.get(tid, []))
+        return blocked
 
     def summary(self) -> str:
         """Compact text summary for system prompt injection. Cached until mutation."""

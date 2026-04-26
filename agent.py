@@ -37,12 +37,12 @@ PLANNING_TOOLS = {
     "web_search",      # read-only lookup (fetching full pages waits for execution)
 }
 
-# In verify mode the planner can also peek at the input it'll be reasoning
-# about — extract_caption_claims is read-only and the rest of the verify
-# tools are deferred until the execution phase.
+# Verify-mode planning is structural-only: build the DAG via manage_tasks
+# and exit. Evidence gathering — including extract_caption_claims — is
+# deferred to the execution phase so we don't double-bill tools when the
+# planner does work that the executor will redo.
 VERIFY_PLANNING_TOOLS = {
     "manage_tasks",
-    "extract_caption_claims",
 }
 
 
@@ -196,6 +196,15 @@ class AgentRuntime:
 
         # 1. Add user message to session
         session.add_message("user", user_message)
+
+        # 1.5 DAG-mode execution phase: delegate to the scheduler. The agent
+        # loop does NOT iterate during DAG execution — the scheduler runs
+        # the DAG directly, then a single synthesis LLM call produces the
+        # final report.
+        if is_dag_mode and session.deep_work_phase == "executing":
+            async for ev in self._run_dag_execution(session, user_message, effective_mode):
+                yield ev
+            return
 
         # 2. Determine limits based on mode and phase
         is_planning = False
@@ -670,6 +679,102 @@ class AgentRuntime:
             yield AgentEvent("error", {
                 "message": f"Agent loop hit max iterations ({max_iterations}). Stopping.",
             })
+
+    async def _run_dag_execution(
+        self,
+        session: Session,
+        approval_msg: str,
+        effective_mode: str,
+    ) -> AsyncIterator[AgentEvent]:
+        """Execute a DAG-mode session's executing phase via DagScheduler.
+
+        Bypasses the agent's iteration loop. After the scheduler finishes,
+        runs a single LLM synthesis call and emits text + done events.
+        """
+        from scheduler import DagScheduler, SchedulerError, synthesize_dag_report
+
+        # Plan-size cap. Refuse to start if the planner went wild.
+        if effective_mode == "verify":
+            max_nodes = self.config.agent.verify.max_dag_nodes
+        else:
+            max_nodes = self.config.agent.deep_work.max_dag_nodes
+        node_count = len(session.task_store.list_all())
+        if node_count > max_nodes:
+            session.flush()
+            session.task_store.flush()
+            yield AgentEvent("error", {
+                "message": (
+                    f"DAG too large: {node_count} nodes exceeds "
+                    f"{effective_mode}.max_dag_nodes={max_nodes}. Refusing to execute."
+                ),
+            })
+            return
+
+        yield AgentEvent("thinking", {
+            "iteration": 1,
+            "phase": "dag_execute",
+            "node_count": node_count,
+            "mode": effective_mode,
+        })
+
+        scheduler = DagScheduler(
+            task_store=session.task_store,
+            tool_registry=self.tools,
+            agent=self,
+            mode=effective_mode,
+            session_id=session.session_id,
+        )
+        try:
+            dag_result = await scheduler.run()
+        except SchedulerError as e:
+            session.flush()
+            session.task_store.flush()
+            yield AgentEvent("error", {"message": f"Scheduler error: {e}"})
+            return
+
+        yield AgentEvent("task_update", {
+            "tasks": session.task_store.to_dict(),
+            "summary": session.task_store.summary(),
+        })
+        yield AgentEvent("thinking", {
+            "iteration": 1,
+            "phase": "dag_complete",
+            "completed": len(dag_result["completed_tasks"]),
+            "failed": len(dag_result["failed_tasks"]),
+            "blocked": len(dag_result["blocked_tasks"]),
+            "elapsed_ms": dag_result["elapsed_ms"],
+        })
+
+        # Original request — first user message in this session, which
+        # for verify mode is the "VERIFICATION REQUEST..." blob.
+        original_request = ""
+        for msg in session.messages:
+            if msg.role == "user" and isinstance(msg.content, str):
+                original_request = msg.content
+                break
+
+        yield AgentEvent("thinking", {"iteration": 1, "phase": "synthesis"})
+        report_text = await synthesize_dag_report(
+            agent=self,
+            task_store=session.task_store,
+            mode=effective_mode,
+            original_request=original_request,
+        )
+
+        # Persist the synthesis as the assistant's reply.
+        session.add_message("assistant", report_text)
+        session.flush()
+        session.task_store.flush()
+
+        yield AgentEvent("text", {"text": report_text})
+        yield AgentEvent("done", {
+            "text": report_text,
+            "iterations": 1,  # one synthesis LLM call
+            "model": self.agent_config.model.model_id,
+            "usage": {},
+            "mode": effective_mode,
+            "dag_result": dag_result,
+        })
 
     async def run_simple(
         self,

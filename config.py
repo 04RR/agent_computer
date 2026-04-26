@@ -55,13 +55,19 @@ class DeepWorkConfig(BaseModel):
     max_iterations: int = 200
     token_budget: int = 500000
     warning_threshold: float = 0.8
+    # Hard cap on plan size. The DAG scheduler refuses to execute a plan
+    # with more nodes than this — protects against runaway authoring.
+    max_dag_nodes: int = 30
 
 
 class VerifyConfig(BaseModel):
-    """Iteration limits for verify mode. Verification is bounded work — if the
-    agent is making more than ~20 LLM calls, something is wrong."""
+    """Iteration limits for verify mode. With Week 2's scheduler, agent
+    iterations during DAG execution drop to zero — counts only cover
+    planning + the final synthesis call. 20/10 is generous."""
     max_iterations: int = 20
     planning_max_iterations: int = 10
+    # Hard cap on plan size. See DeepWorkConfig.max_dag_nodes.
+    max_dag_nodes: int = 30
 
 
 class ReflectionConfig(BaseModel):

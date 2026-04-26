@@ -66,31 +66,38 @@ def main(base_url: str = "http://localhost:8000") -> None:
     print("=== response shape ===")
     for k in ("session_id", "iterations", "elapsed_ms", "stub_mode"):
         print(f"  {k}: {payload.get(k)!r}")
-    print(f"  tasks: {len(payload.get('tasks') or [])} task(s) authored")
+    tasks = payload.get("tasks") or []
+    print(f"  tasks: {len(tasks)} task(s) authored")
     print(f"  report: {len(payload.get('report') or '')} chars")
     print()
 
     report = payload.get("report") or ""
 
-    # Print the report unconditionally, BEFORE any assertion or warning, so
-    # debug runs always show what the agent actually produced even if checks
-    # below complain.
+    # Print the report unconditionally — debug runs always show what the
+    # synthesis produced even when downstream checks complain.
     print("=== full report ===")
     print(report)
     print("=== end report ===\n")
 
+    # Per-task summary (Week 2: every node should have completed status
+    # and a populated output, set by the scheduler).
+    print("=== task outcomes ===")
+    tool_call_counts: dict[str, int] = {}
+    for t in tasks:
+        out = t.get("output") or {}
+        out_summary = "<empty>" if not out else f"{len(json.dumps(out))} chars"
+        if isinstance(out, dict) and "error" in out:
+            out_summary += f" (error: {str(out['error'])[:60]})"
+        print(f"  task {t['id']:>2}: {t['status']:<10} {t['node_type']:<7} {t['title'][:50]:50s} output={out_summary}")
+        # Count which tool was called by each tool node
+        if t["node_type"] == "tool":
+            tname = (t.get("config") or {}).get("tool_name", "?")
+            tool_call_counts[tname] = tool_call_counts.get(tname, 0) + 1
+    print()
+
     warnings: list[str] = []
 
-    # Soft checks — surface as warnings, don't fail the smoke run.
-    if not payload.get("tasks"):
-        warnings.append(
-            "agent did not author a DAG via manage_tasks. The SOUL guidelines "
-            "ask for one, but with the linear executor (pre-Week-2 scheduler) "
-            "the DAG is theatrical anyway — calling tools directly produces "
-            "the same evidence. Consider this a SOUL-following gap, not a "
-            "verification failure. Smaller / less instruction-tuned models "
-            "tend to skip the DAG step."
-        )
+    # ── Soft checks ──
 
     if payload.get("stub_mode") == "hit":
         if "stub" not in report.lower() and "simulat" not in report.lower():
@@ -101,11 +108,58 @@ def main(base_url: str = "http://localhost:8000") -> None:
                 "real evidence."
             )
 
-    # Hard checks — these are real failures.
+    # Each verification tool should appear at most once in the DAG.
+    # 0 calls per tool is also tolerated (planner may have skipped one
+    # for a reason — surface it but don't fail).
+    expected_tools = {
+        "extract_caption_claims",
+        "reverse_image_search",
+        "extract_image_metadata",
+        "fact_check_lookup",
+        "reconcile_image_with_caption",
+    }
+    for tool_name, n in tool_call_counts.items():
+        if tool_name in expected_tools and n > 1:
+            warnings.append(
+                f"{tool_name} appears {n} times in the DAG — Week 2 "
+                f"design expects exactly one call per evidence tool."
+            )
+    missing_tools = expected_tools - set(tool_call_counts)
+    if missing_tools:
+        warnings.append(
+            f"DAG omitted these expected verification tools: "
+            f"{sorted(missing_tools)}"
+        )
+
+    # Failed or blocked tasks → soft warning (the synthesis will still
+    # acknowledge them per the prompt, so don't fail the smoke).
+    bad_tasks = [t for t in tasks if t["status"] in ("failed", "blocked")]
+    if bad_tasks:
+        warnings.append(
+            f"{len(bad_tasks)} task(s) in failed/blocked state: "
+            f"{[(t['id'], t['status']) for t in bad_tasks]}"
+        )
+
+    # ── Hard checks ──
+
     assert payload.get("session_id"), "missing session_id"
-    assert report, "report is empty — agent did not synthesize"
-    assert payload.get("iterations", 0) > 0, "iterations should be > 0"
+    assert report, "report is empty — synthesis did not produce content"
     assert "error" not in payload, f"endpoint returned an error: {payload.get('error')}"
+
+    # Week 2: agent iterations should be much lower because DAG execution
+    # bypasses the agent loop. Allow planning iterations + 1 synthesis call.
+    iters = payload.get("iterations", 0)
+    assert iters > 0, "iterations should be > 0"
+    if iters > 15:
+        warnings.append(
+            f"iterations={iters} — Week 2 expects much lower (planning + "
+            f"1 synthesis call). High count suggests the agent loop ran "
+            f"during execution instead of being bypassed."
+        )
+
+    # Week 2 hard floor: at least one task should exist (the planner
+    # built a DAG). With Bug 1+2+3 fixed, the planner has no excuse.
+    assert tasks, "no tasks — planner failed to author a DAG"
 
     if warnings:
         print("=== warnings ===")

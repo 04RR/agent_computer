@@ -239,8 +239,13 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
         mode = ctx.get("mode", "bounded")
         store = ctx.get("task_store")
 
-        if mode != "deep_work":
-            return json.dumps({"error": "Task management not available in bounded mode. Switch to deep work mode to use tasks."})
+        if mode not in ("deep_work", "verify"):
+            return json.dumps({
+                "error": (
+                    "Task management not available in bounded mode. "
+                    "Switch to deep_work or verify mode to use tasks."
+                ),
+            })
 
         if store is None:
             return json.dumps({"error": "No task store available"})
@@ -286,12 +291,23 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
             if task_id is None:
                 return json.dumps({"error": "task_id is required for update"})
             kwargs = {}
+            ignored_status_warning: str | None = None
             if title is not None:
                 kwargs["title"] = title
             if description is not None:
                 kwargs["description"] = description
             if status is not None:
-                kwargs["status"] = status
+                # During DAG execution the scheduler is the source of truth
+                # for status. Agent-node calls that try to set status get
+                # silently ignored with a warning surfaced in the response.
+                if ctx.get("dag_mode_active"):
+                    ignored_status_warning = (
+                        f"Status updates are runtime-managed during DAG "
+                        f"execution; your status={status!r} update was ignored. "
+                        f"Continue with the next step or finalize."
+                    )
+                else:
+                    kwargs["status"] = status
             if node_type is not None:
                 if node_type not in valid_node_types:
                     return json.dumps({
@@ -314,7 +330,10 @@ def register_task_tool(registry: ToolRegistry, allowed: list[str] | None = None)
             task = store.update(task_id, **kwargs)
             if not task:
                 return json.dumps({"error": f"Task {task_id} not found"})
-            return json.dumps({"status": "updated", "task": task.to_dict()})
+            response: dict = {"status": "updated", "task": task.to_dict()}
+            if ignored_status_warning:
+                response["warning"] = ignored_status_warning
+            return json.dumps(response)
 
         elif action == "connect":
             if from_task is None or to_task is None:

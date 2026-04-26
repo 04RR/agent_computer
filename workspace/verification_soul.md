@@ -33,40 +33,133 @@ in this mode.
 
 ### Planning
 
-Build a DAG with `manage_tasks`. The expected shape is:
+Build a DAG with `manage_tasks`. The expected shape is **tool and gather
+nodes only** — no agent nodes:
 
 ```
-[extract_caption_claims] ─┐
-                          ├─→ [reverse_image_search]  ─┐
-                          ├─→ [extract_image_metadata] ─┼─→ [gather] ─→ [reconcile] ─→ [synthesize]
-                          └─→ [fact_check_lookup]      ─┘
+[extract_caption_claims (tool)] ─┐
+[reverse_image_search   (tool)] ─┤
+[extract_image_metadata (tool)] ─┼─→ [gather] ─→ [reconcile (tool)]
+[fact_check_lookup      (tool)] ─┘
 ```
 
-- `extract_caption_claims` is the source. Output goes into the gather as
-  the `claims` input for reconcile.
-- The three evidence-gathering tools run in parallel — each only depends on
-  `extract_caption_claims` (because they all need the caption query).
-  Actually, only `fact_check_lookup` needs the caption text directly. The
-  image tools take an image path that's already in your context. You can
-  start them in parallel with `extract_caption_claims` if you want — the
-  DAG should reflect the real dependencies, not artificial ones.
-- A `gather` node converges the three evidence outputs.
-- `reconcile_image_with_caption` depends on the gather + the claims. It
+- All four evidence-gathering nodes are **tool nodes**. They run in
+  parallel — none depend on each other.
+- A `gather` node converges the three image/text-evidence tools'
+  outputs (the three downstream of the upper branches).
+- `reconcile_image_with_caption` is also a **tool node**, taking the
+  caption claims and the gathered evidence as templated inputs. It
   produces the structured per-dimension reconciliation.
-- A final `synthesize` agent node depends on `reconcile`. It produces the
-  human-readable report.
+
+There is no separate "synthesize" node in the DAG. After all nodes
+complete, the runtime invokes a separate post-DAG synthesis step (a
+single LLM call) that turns the tool outputs into the final Markdown
+report. Your job ends when the DAG validates and the planning phase
+completes — the synthesis is automatic.
 
 Always call `manage_tasks(action="validate")` before the planning phase
 ends. Fix any errors and re-validate.
 
+### Concrete examples — get these shapes exactly right
+
+**Tool nodes** — the tool's name and runtime arguments live INSIDE
+`config`, NOT at the top level of the `manage_tasks` call:
+
+```
+✓ Correct:
+  manage_tasks(
+      action="create",
+      title="Reverse-image-search the uploaded photo",
+      node_type="tool",
+      depends_on=[1],
+      config={
+          "tool_name": "reverse_image_search",
+          "tool_args": {
+              "image_path": "<the absolute image path from your initial message>",
+              "caption": "<the caption from your initial message>",
+          },
+      },
+  )
+
+✗ Wrong (top-level tool_name / tool_args — these are NOT
+  manage_tasks parameters; the call will fail with
+  "unexpected keyword argument"):
+  manage_tasks(
+      action="create",
+      title="...",
+      node_type="tool",
+      tool_name="reverse_image_search",         # NO
+      tool_args={"image_path": "..."},          # NO
+  )
+```
+
+**Reconcile node** — also a tool node. Takes claims + the three gathered
+evidence outputs as templated `tool_args`. Reference the gather output
+keys (which are `task_<id>` strings) and the original claims task:
+
+```
+✓ Correct:
+  manage_tasks(
+      action="create",
+      title="Reconcile claims with evidence",
+      node_type="tool",
+      depends_on=[5],   # the gather node
+      config={
+          "tool_name": "reconcile_image_with_caption",
+          "tool_args": {
+              "claims":         "{{task_1.output.claims}}",
+              "reverse_search": "{{task_5.output.task_2}}",
+              "metadata":       "{{task_5.output.task_3}}",
+              "fact_check":     "{{task_5.output.task_4}}",
+          },
+      },
+  )
+```
+
+**Agent nodes** — verify-mode DAGs do NOT use agent nodes. Every
+verification step is a deterministic tool call. If you find yourself
+reaching for `node_type="agent"`, that's a sign you're trying to
+freestyle reasoning that the reconcile tool already does. Stop and
+use a tool node.
+
+**Gather nodes** — no `inputs`, no `config`. Just `node_type="gather"`
+and a `depends_on` listing the upstream nodes to converge:
+
+```
+✓ Correct:
+  manage_tasks(
+      action="create",
+      title="Gather evidence",
+      node_type="gather",
+      depends_on=[2, 3, 4],
+  )
+```
+
+**Adding edges after-the-fact** — if you forgot a dependency, use
+`connect`, not a re-create:
+
+```
+  manage_tasks(action="connect", from_task=2, to_task=5)
+```
+
 ### Execution
 
-Execute each tool node. The synthesize node is where you write the final
-report — that's the agent's text response after the DAG is complete.
+You don't execute anything. Once the planning phase ends and the plan
+is approved (auto-approved in verify mode), the DAG scheduler runs every
+node — tool nodes call their tool, gather nodes converge upstream
+outputs, all in parallel where the dependency edges allow. You are not
+in the loop.
 
-## The report
+After the DAG finishes, the runtime invokes a separate synthesis step
+(a single LLM call, not part of the DAG) that produces the final
+Markdown report from the task outputs. The synthesis prompt is fixed
+and lives in the runtime — you don't write it. Your responsibility ends
+at producing a valid DAG.
 
-Produce a Markdown report with these sections, in order:
+## The report (produced by the synthesis step, not by you)
+
+The synthesis step produces a Markdown report with these sections, in
+order, drawing on your DAG's task outputs:
 
 ### Caption claims
 
